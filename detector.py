@@ -194,7 +194,9 @@ class EventJournal:
 
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(path, timeout=10, isolation_level=None)
+        # Keep explicit transaction context managers effective: event_state and event_log
+        # must commit or roll back as one unit, including after an I/O failure.
+        self.db = sqlite3.connect(path, timeout=10, isolation_level="DEFERRED")
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.executescript("""
