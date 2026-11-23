@@ -64,3 +64,13 @@ python3 -m unittest discover -s tests -v
 The first proposed engineering build is the read-only Robinhood launch detector, on branch [`build/one-detector`](https://github.com/Ld0g22/Blackswan/tree/build/one-detector), with its preserved upstream regressions plus targeted atomicity and recovery-health corrections. It is **not** a selector, execution engine, wallet integration or live campaign.
 
 Read [`docs/BUILD_ONE_DETECTOR.md`](docs/BUILD_ONE_DETECTOR.md) for upstream commit, contract, test evidence and verification gaps. `DETECTOR_README.md` is the preserved historical detector manual; the Build One document governs post-import changes and readiness. **Passing local CI does not establish live network coverage.**
+
+## Build Two — peak tracking and threshold-triggered execution
+
+The original buying-block-filter execution stack is preserved in [Build Two](docs/BUILD_TWO_RELEASE_REPORT.md), with historical source from `Ld0g22/BlackswanNovember`. It supports executable ETH/WETH/USDG route comparison, receipt-confirmed position tracking and latched exits. The original sacrifice implementation is retained as an inactive dependency.
+
+**Selector integration tested:** a common `interfaceVersion:1` SQLite decision outbox, verified with ETH, WETH and USDG and two policy-labelled producer variants. The old launcher is not yet selector-configurable: it starts the historical buying-block selector. New selection logic must implement the documented decision contract, and the launcher needs a minimal entrypoint switch.
+
+**Thresholds:** historical tested ladders are available; unrestricted multiplier configuration remains a separate wiring task. Historic sacrifice size/wait are still fixed. **Read-only/offline verification only** for the combined build; no new real-money trade is claimed and no trading has been authorised.
+
+See [Build Two provenance, tests and limitations](docs/BUILD_TWO_RELEASE_REPORT.md).
