@@ -18,7 +18,9 @@ PROBE_ENTRY_SECONDS=3.0
 
 class LambGate:
     def __init__(self,executor,receiptReader,waitBlocks=None):
-        if waitBlocks is not None and (type(waitBlocks) is not int or waitBlocks!=500):
+        if waitBlocks is not None and (
+                type(waitBlocks) is not int or waitBlocks < 1 or
+                (waitBlocks != 500 and executor.store.configuredCampaign is None)):
             raise ValueError('UNSUPPORTED_SACRIFICIAL_BLOCK_GATE')
         self.owner=executor
         self.store=executor.store
@@ -30,9 +32,14 @@ class LambGate:
         # Unversioned historical 500-block campaigns retain their original gate.
         # Minimal offline test stores without a policy attribute exercise the
         # new collector independently.
-        filtered=(waitBlocks==500 and
-                  getattr(self.store,'probeMaxBuyingBlocks',7)==7)
-        self.activity=ProbeBuyingBlocks(self.store,self.owner.rpc) if filtered else None
+        filtered=((self.store.configuredCampaign is not None and
+                   self.store.probeMaxBuyingBlocks is not None and
+                   waitBlocks is not None and waitBlocks >= 500) or
+                  (self.store.configuredCampaign is None and waitBlocks==500 and
+                   getattr(self.store,'probeMaxBuyingBlocks',7)==7))
+        self.activity=(ProbeBuyingBlocks(
+            self.store,self.owner.rpc,maxBuyingBlocks=self.store.probeMaxBuyingBlocks
+            if self.store.configuredCampaign else MAX_BUYING_BLOCKS) if filtered else None)
 
     @staticmethod
     def blockNumber(value):
@@ -171,6 +178,9 @@ class LambGate:
         if (selection['status']!='LAMB_QUEUED' or not self.store.eligible()
                 or self.revoked(selectionId)):
             return
+        if not self.store.canSpend("PROBE_BUY"):
+            self.state(selectionId,"PROBE_FAILED","SACRIFICE_BUDGET_LIMIT")
+            return
         if self.store.transactions(selectionId,'PROBE_BUY'):
             self.state(selectionId,'PROBE_PENDING')
             return
@@ -178,12 +188,12 @@ class LambGate:
         if reason:
             self.state(selectionId,'PROBE_FAILED',reason)
             return
-        if time.time()-selection['decisionAt']>PROBE_ENTRY_SECONDS:
+        if time.time()-selection['decisionAt']>self.store.sacrificeDeadlineSeconds:
             self.state(selectionId,'PROBE_FAILED','MISSED_1P_DEADLINE')
             return
         try:
             rate=await self.owner.fx.get()
-            amountWei=int((PROBE_GBP/rate*10**18).to_integral_value(rounding=ROUND_DOWN))
+            amountWei=int((self.store.probeGbp/rate*10**18).to_integral_value(rounding=ROUND_DOWN))
             if amountWei<=0:raise RuntimeError('ZERO_PROBE_VALUE')
             quote=(await self.owner.swaps.verifiedBuyCandidates(token,amountWei))[0]
             if time.time()-selection['decisionAt']>PROBE_ENTRY_SECONDS:
@@ -266,7 +276,7 @@ class LambGate:
         self.store.observe(token=selection['token'],phase='PROBE_ENTRY',at=now,
             block=str(receipt.get('blockNumber')),venue_id=None,
             status='CONFIRMED_FILL',quantity=str(qty),
-            out_wei=str(transaction['inputAmount']),gbp=str(PROBE_GBP),
+            out_wei=str(transaction['inputAmount']),gbp=str(self.store.probeGbp),
             multiple=None,basis='RECEIPT_TOKEN_TRANSFER',reason=None)
         print('LAMB CONFIRMED 1P',selection['token'],qty,flush=True)
 
@@ -278,9 +288,13 @@ class LambGate:
         probe=self.row(selectionId)
         if not probe or probe['confirmedAt'] is None:return
         now=time.time()
+        # Fail-closed, but retry temporary provider/quote outages. A previous
+        # PROBE_UNKNOWN terminal state silently discarded valid survivors.
+        if probe['lastCheck'] is not None and now-float(probe['lastCheck'])<3.0:
+            return
         targetBlock=None
         if self.waitBlocks is None:
-            if now<float(probe['confirmedAt'])+WAIT_SECONDS:
+            if now<float(probe['confirmedAt'])+self.store.probeWaitSeconds:
                 return
         else:
             # Missing bins are not zero buys; wait for the progressive collector
@@ -308,7 +322,7 @@ class LambGate:
                 return
             if activityVerdict=='FAIL':
                 self.state(selectionId,'PROBE_FAILED',
-                           'MAX_'+str(MAX_BUYING_BLOCKS)+'_BUYING_BLOCKS_EXCEEDED_'+str(count))
+                           'MAX_'+str(self.activity.maxBuyingBlocks)+'_BUYING_BLOCKS_EXCEEDED_'+str(count))
                 return
             if activityVerdict!='PASS':
                 return
@@ -359,11 +373,18 @@ class LambGate:
         except (RuntimeError,ValueError,TypeError,KeyError,IndexError) as exc:
             # An unavailable RPC quote is UNKNOWN, never a grant of permission.
             reason=str(exc)[:160]
-            verdict=('PROBE_FAILED' if any(x in reason.upper() for x in
-                     ('NOT_SELLABLE','NO_TWO_WAY','ZERO_PROJECTED','PONS_V2','NO_SELL_ROUTE'))
-                     else 'PROBE_UNKNOWN')
-            self.state(selectionId,verdict,reason)
+            fatal=any(x in reason.upper() for x in
+                      ('NOT_SELLABLE','NO_TWO_WAY','ZERO_PROJECTED','PONS_V2','NO_SELL_ROUTE'))
+            verdict='PROBE_FAILED' if fatal else 'PROBE_CONFIRMED'
+            if fatal:
+                self.state(selectionId,verdict,reason)
+            else:
+                # Keep scheduler eligibility; store retry reason and bounded
+                # cooldown WITHOUT converting an unknown into a rejected buy.
+                self.store.db.execute(
+                    "UPDATE selections SET reason=? WHERE selectionId=?",
+                    (reason,selectionId))
             self.store.db.execute(
-                'UPDATE lamb_probes SET lastCheck=? WHERE selectionId=?',
-                (time.time(),selectionId))
+                'UPDATE lamb_probes SET lastCheck=?,reason=? WHERE selectionId=?',
+                (time.time(),reason,selectionId))
             print('LAMB REJECTED',selection['token'],verdict,reason,flush=True)

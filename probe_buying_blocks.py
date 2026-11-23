@@ -74,11 +74,14 @@ def buyingBlockFromSwap(log,pool,baseIndex,low,high):
 
 
 class ProbeBuyingBlocks:
-    def __init__(self,store,rpc):
+    def __init__(self,store,rpc,maxBuyingBlocks=MAX_BUYING_BLOCKS):
         if not HEX_ADDRESS.fullmatch(MANAGER) or not HEX_TOPIC.fullmatch(SWAP):
             raise RuntimeError("INVALID_ACTIVITY_CHAIN_CONSTANTS")
         self.store=store
         self.rpc=rpc
+        if type(maxBuyingBlocks) is not int or not 0<=maxBuyingBlocks<=500:
+            raise ValueError("INVALID_ACTIVITY_BUYING_BLOCK_CAP")
+        self.maxBuyingBlocks=maxBuyingBlocks
         self.collectLock=asyncio.Lock()
         self.requestPause=.35
         self.store.db.executescript("""
@@ -204,7 +207,7 @@ class ProbeBuyingBlocks:
             seen.update(blocks)
             evidence.append([index,low,high,row["endHash"],blocks])
         count=len(seen)
-        verdict="PASS" if count<=MAX_BUYING_BLOCKS else "FAIL"
+        verdict="PASS" if count<=self.maxBuyingBlocks else "FAIL"
         digest=hashlib.sha256(json.dumps(
             [selectionId,probeBlock,pool,evidence],
             separators=(",",":"),sort_keys=True).encode()).hexdigest()
@@ -228,7 +231,7 @@ class ProbeBuyingBlocks:
               FROM probe_activity_verdicts v WHERE v.selectionId=?""",
             (selectionId,)).fetchone()
         return (row if row and row["verdict"]=="PASS"
-                and 0<=row["count"]<=MAX_BUYING_BLOCKS else None)
+                and 0<=row["count"]<=self.maxBuyingBlocks else None)
 
     async def preBuyVerified(self,selection,probeBlock):
         """Final fail-closed guard immediately BEFORE the main BUY is signed."""

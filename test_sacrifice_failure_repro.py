@@ -6,14 +6,17 @@ No wallet, network, signed transaction or token balances.
 import inspect
 import unittest
 
+from campaign_v3 import defaultCampaign, validateCampaign
 from live_executor import ExecutionStore
 from test_lamb_500_block_gate import TestProbe500BlockGate
 
 
 class SacrificeRequiredBehavior(unittest.IsolatedAsyncioTestCase):
-    def test_sacrifice_is_on_in_default_execution_store(self):
+    def test_new_campaign_defaults_sacrifices_on_without_changing_legacy_database_mode(self):
+        # The original non-sacrifice mode must remain compatible for old runs.
         actual = inspect.signature(ExecutionStore.__init__).parameters["sacrifice"].default
-        self.assertIs(actual, True, "Sacrifice is OFF by default in the restored build")
+        self.assertIs(actual, False)
+        self.assertIs(validateCampaign(defaultCampaign("0x" + "1"*40))["sacrifice"]["enabled"], True)
 
     async def test_transient_rpc_429_during_survival_retries_without_losing_position(self):
         case = TestProbe500BlockGate("test_exact_500_blocks_then_fresh_quote_and_normal_buy_queue")
