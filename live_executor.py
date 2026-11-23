@@ -349,7 +349,9 @@ class ExecutionStore:
         return self.db.execute("SELECT COUNT(*) FROM selections WHERE status IN ('QUEUED','BUY_PENDING','BUY_UNVERIFIED')").fetchone()[0]
 
     def eligible(self):
-        return (not self.sacrifice or self.get('intakeState','OPEN')=='OPEN') and (self.acquired()+self.reserved()<self.purchaseLimit)
+        return ((self.configuredCampaign is None and not self.sacrifice)
+                or self.get('intakeState','OPEN')=='OPEN') and (
+                self.acquired()+self.reserved()<self.purchaseLimit)
 
     def transactions(self,selectionId,kind):
         return self.db.execute('SELECT * FROM transactions WHERE selectionId=? AND kind=? ORDER BY createdAt',
@@ -701,6 +703,9 @@ class LiveExecutor:
 
     async def buy(self,row):
         selectionId=row['selectionId']; token=row['token']
+        if (self.store.configuredCampaign is not None and
+                self.store.get('intakeState','OPEN')!='OPEN'):
+            return
         # Only the gate may enable a 10p purchase in the five-lamb campaign.
         lamb=getattr(self,'lamb',None)
         # Enforce again at the last step before constructing/signing a swap.
@@ -1227,11 +1232,18 @@ def main():
     parser.add_argument('--buy-gbp')
     parser.add_argument('--max-purchases')
     parser.add_argument('--campaign-wallet')
+    parser.add_argument('--campaign-file',type=Path,help='Immutable configured v3 campaign.json')
     parser.add_argument('--probe-wait-blocks',type=int,choices=(500,),
                         help='500-block survival gate (frozen by campaign manifest)')
     parser.add_argument('--probe-max-buying-blocks',type=int,choices=(7,),
                         help='Versioned post-probe activity gate (new campaigns only)')
     args=parser.parse_args()
+    configured=(validateCampaign(json.loads(args.campaign_file.read_text()))
+                if args.campaign_file is not None else None)
+    if configured and any((args.sacrifice_five,args.sacrifice_one_50p,args.sacrifice_two_50p,
+                           args.sacrifice_two_50p_2x,args.sacrifice_one_20p_2x,
+                           args.flex_lamb,args.flex_3x5x,args.flex_1p5x3x)):
+        parser.error('Configured campaign cannot mix legacy mode flags')
     if sum((args.sacrifice_five,args.sacrifice_one_50p,args.sacrifice_two_50p,args.sacrifice_two_50p_2x,args.sacrifice_one_20p_2x,args.flex_lamb,args.flex_3x5x,args.flex_1p5x3x))>1:
         parser.error('Choose only one sacrificial campaign mode')
     lambMode=args.sacrifice_five or args.sacrifice_one_50p or args.sacrifice_two_50p or args.sacrifice_two_50p_2x or args.sacrifice_one_20p_2x or args.flex_lamb or args.flex_3x5x or args.flex_1p5x3x
@@ -1248,7 +1260,8 @@ def main():
         parser.error('--probe-max-buying-blocks requires a 500-block sacrificial campaign')
     if args.command=='status':
         if not args.db.exists():parser.error('Campaign database not found')
-        store=ExecutionStore(args.db,sacrifice=lambMode,oneFifty=args.sacrifice_one_50p,
+        store=(ExecutionStore(args.db,configuredCampaign=configured) if configured is not None
+               else ExecutionStore(args.db,sacrifice=lambMode,oneFifty=args.sacrifice_one_50p,
                              twoFifty=args.sacrifice_two_50p,
                              twoFifty2x=args.sacrifice_two_50p_2x,
                              oneTwenty2x=args.sacrifice_one_20p_2x,
@@ -1256,7 +1269,7 @@ def main():
                              flexBuyGbp=args.buy_gbp,
                              flexMaxPurchases=args.max_purchases,flexWalletAddress=args.campaign_wallet,
                              probeWaitBlocks=args.probe_wait_blocks,
-                             probeMaxBuyingBlocks=args.probe_max_buying_blocks)
+                             probeMaxBuyingBlocks=args.probe_max_buying_blocks))
         print(json.dumps(store.status(),indent=2))
         store.db.close()
         return
@@ -1269,9 +1282,12 @@ def main():
         password=reader.read().rstrip('\n')
     account,privateKey=decodeKeystore(args.wallet_file,password)
     del password
+    if configured and account.address.lower()!=configured["walletPublicAddress"]:
+        raise SystemExit('CONFIGURED_CAMPAIGN_WALLET_MISMATCH')
     if (args.flex_lamb or args.flex_3x5x or args.flex_1p5x3x) and account.address.lower()!=args.campaign_wallet.lower():
         raise SystemExit('FLEX_WALLET_KEYSTORE_MISMATCH')
-    store=ExecutionStore(args.db,sacrifice=lambMode,oneFifty=args.sacrifice_one_50p,
+    store=(ExecutionStore(args.db,configuredCampaign=configured) if configured is not None
+           else ExecutionStore(args.db,sacrifice=lambMode,oneFifty=args.sacrifice_one_50p,
                              twoFifty=args.sacrifice_two_50p,
                              twoFifty2x=args.sacrifice_two_50p_2x,
                              oneTwenty2x=args.sacrifice_one_20p_2x,
@@ -1279,15 +1295,15 @@ def main():
                              flexBuyGbp=args.buy_gbp,
                              flexMaxPurchases=args.max_purchases,flexWalletAddress=args.campaign_wallet,
                              probeWaitBlocks=args.probe_wait_blocks,
-                             probeMaxBuyingBlocks=args.probe_max_buying_blocks)
+                             probeMaxBuyingBlocks=args.probe_max_buying_blocks))
     # Lock per wallet across campaign directories. Must not run two live engines.
-    walletLock=(globalWalletLock(account.address) if store.flexLamb else
+    walletLock=(globalWalletLock(account.address) if (store.flexLamb or store.configuredCampaign is not None) else
                 Path(__file__).resolve().parent/('.live_wallet_'+account.address.lower()+'.lock'))
     walletLock.parent.mkdir(parents=True,exist_ok=True)
     with walletLock.open('a+') as lock:
         try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError:raise SystemExit('Another campaign is using this wallet')
-        if store.flexLamb:
+        if store.flexLamb or store.configuredCampaign is not None:
             overlaps=otherLiveExecutors()
             if overlaps:
                 raise SystemExit('OLDER_LIVE_EXECUTOR_RUNNING: stop earlier campaign executors: '+str(overlaps))
