@@ -1,0 +1,21 @@
+# Never commit API credentials, wallet material, local data, or virtual environments.
+.env
+.env.*
+*.key
+*.pem
+.venv/
+data/
+__pycache__/
+*.py[cod]
+*.sqlite3
+*.sqlite3-*
+.pytest_cache/
+.coverage
+.DS_Store
+
+# Build One: additional protection because this repository is public.
+wallet.json
+wallet*.json
+*keystore*.json
+treasury*.json
+secrets/
