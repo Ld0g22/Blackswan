@@ -2,7 +2,7 @@
 
 **Source of truth:** `Ld0g22/BlackswanNovember`, detector-only snapshot `108f4d5abfd45edc80051a55c9beb72412a79ceb` dated 2026-11-06.
 **Source file:** `detector.py`, with original regression suite `test_detector.py`, pinned `requirements.txt`, `DETECTOR_README.md` and `.gitignore`. Compare Git blob SHA to original before changing any source.
-**Branch:** `build/one-detector`. No selector, signer, sacrifice, peak tracker or execution code. **No funds move through this module.**
+**Branch:** `build/one-detector`. On 2026-11-23, original code was imported with matching Git hashes, then intentionally amended for proven detector defects: SQLite outbox atomicity and explicit recovery-health reporting. Original upstream remains unchanged and recoverable. No selector, signer, sacrifice, peak tracker or execution code. **No funds move through this module.**
 
 ## Intended behaviour
 
@@ -13,7 +13,7 @@ The detector is a **producer**, not a selector, peak tracker or transaction exec
 ## Validation levels
 
 - **D0:** imported with provenance and source identity.
-- **D1:** original tests and project tests pass on Build One's exact commit.
+- **D1:** original tests and project tests pass on Build One's exact commit. Regression evidence: injected SQLite outbox write errors originally left event_state committed without an output row, and a failed backfill originally had no machine-readable recovery status. Added failing tests, then made both tests pass. See `tests/test_detector_journal_atomicity.py` and `tests/test_detector_recovery_health.py`.
 - **D2:** integration replay, interruption/429/reconnect/resume, reorg and outbox consumer tests pass.
 - **D3:** read-only actual Robinhood RPC verification, recent matching-chain-log comparison and latency/coverage measurements, plus verified source deployments.
 - **D4/D5:** not applicable to detector alone; end-to-end trading requires separate permissions and components.
@@ -22,7 +22,7 @@ Do not declare “flawless” or D3 from unit tests. CI is local mock validation
 
 ## Important audit targets
 
-1. **Incomplete recovery while live:** a failed or cancelled backfill must not leave status misleadingly LIVE or obscure the unrecovered block range.
+1. **Incomplete recovery while live:** `status=LIVE` means WebSocket transport only. A failed or cancelled backfill now exposes `recoveryStatus=INCOMPLETE`; `recoveryStatus=COMPLETE` means **the latest bounded recovery pass finished**, not that all historical gaps are healed. Check `reportedGaps` and `lastBackfilledHead` separately.
 2. **Resume cursor versus observed head:** do not mistake a periodic head observation for the highest block actually reconciled.
 3. **Long outages:** 600-block lookback only, so old gaps must be explicit; does not promise full historical completeness.
 4. **Canonicality near the head:** avoid orphaning valid logs due to an indexing delay; test provider stale responses.
