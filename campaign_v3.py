@@ -138,9 +138,9 @@ def validateCampaign(raw: dict) -> dict:
     _shape(limits, ("maxSacrifices", "maxNominalSpendGbp"), "LIMITS")
     maxSacrifices = _integer(limits["maxSacrifices"], "MAX_SACRIFICES", 0, 10000)
     maxNominal = _decimal(limits["maxNominalSpendGbp"], "MAX_NOMINAL_SPEND", Decimal("0.01"), Decimal("10000"), 2)
-    if mainStake * count > maxNominal:
+    if Decimal(mainStake) * count > maxNominal:
         raise ValueError("NOMINAL_LIMIT_CANNOT_COVER_MAIN_CAMPAIGN")
-    if sacrifice["enabled"] and (maxSacrifices < count or mainStake * count + Decimal(sacrificeStake) > maxNominal):
+    if sacrifice["enabled"] and (maxSacrifices < count or Decimal(mainStake) * count + Decimal(sacrificeStake) > maxNominal):
         raise ValueError("SACRIFICE_CAP_INSUFFICIENT")
     result = deepcopy(raw)
     result["walletPublicAddress"] = wallet.lower()
