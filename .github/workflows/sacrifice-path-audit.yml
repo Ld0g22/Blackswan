@@ -1,0 +1,30 @@
+name: Sacrifice path audit — original 500 block tests
+
+on:
+  push:
+    branches: [audit/sacrifice-live-path-20261123]
+
+jobs:
+  audit-sacrifice:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: |
+          python -m pip install -r requirements.txt
+          python -m pip install -r requirements_live.txt
+      - name: Original 500 block and manifest regressions
+        run: python -m unittest -q test_lamb_500_block_gate test_lamb_500_block_monitor test_probe_policy_manifest
+      - name: Default and configurable parameters audit (observation only)
+        run: |
+          python - <<'PY'
+          import inspect
+          from live_executor import ExecutionStore
+          import sacrificial_lamb
+          print("ExecutionStore constructor:", inspect.signature(ExecutionStore.__init__))
+          print("Sacrifice nominal GBP:", sacrificial_lamb.PROBE_GBP)
+          print("Old waiting period (seconds):", sacrificial_lamb.WAIT_SECONDS)
+          print("LambGate constructor:", inspect.signature(sacrificial_lamb.LambGate.__init__))
+          PY
