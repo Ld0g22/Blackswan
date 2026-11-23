@@ -175,7 +175,7 @@ def startOrResume(args,root):
                     if state and state["intake"]=="CLOSED" and state["watch"]=="READY":
                         with sqlite3.connect(f'file:{detDb.resolve()}?mode=ro',uri=True,timeout=2) as db:
                             item=db.execute("SELECT value FROM meta WHERE key='lastConnectedHead'").fetchone()
-                        if item and state["watchHead"]>=int(item[0],0):
+                        if item and state["watchHead"]>=(int(item[0],16) if str(item[0]).startswith('0x') else int(item[0])):
                             retireSources(selector,detector,exeDb)
                             selector=detector=None
                             print("SOURCE INTAKE RETIRED; EXITS REMAIN ACTIVE",flush=True)

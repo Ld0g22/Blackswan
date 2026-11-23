@@ -284,6 +284,10 @@ class ExecutionStore:
                 "probeGbp": str(self.probeGbp),
                 "walletPublicAddress": self.configuredCampaign["walletPublicAddress"],
                 "intakeState": "OPEN",
+                "sacrificeEnabled": "1" if self.sacrifice else "0",
+                "probeWaitUnit": self.configuredCampaign["sacrifice"]["wait"]["unit"],
+                "probeWaitValue": str(self.configuredCampaign["sacrifice"]["wait"]["value"]),
+                "selectorName": self.configuredCampaign["selector"]["name"],
             }
             if self.get("campaignVersion","") in ("1","2"):
                 # A new database may have been seeded by the legacy schema code.

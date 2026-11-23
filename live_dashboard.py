@@ -101,7 +101,8 @@ def snapshot(directory,now=None):
                                and meta.get('exitPolicy')==FLEX_POLICY))
                 early=meta.get('campaignKind')==EARLY_KIND and meta.get('exitPolicy')==EARLY_POLICY
                 pilot=(meta.get('campaignKind')==PILOT_KIND and meta.get('exitPolicy')==PILOT_POLICY) or early
-                sacrificial=meta.get('campaignKind') in ('FIVE_LAMB','ONE_50P_LAMB','TWO_50P_LAMB','TWO_50P_2X_LAMB','ONE_20P_2X_LAMB',FLEX_KIND,PILOT_KIND,EARLY_KIND)
+                configured=meta.get('campaignKind')=='CONFIGURED_V3'
+                sacrificial=(configured and meta.get('sacrificeEnabled')=='1') or meta.get('campaignKind') in ('FIVE_LAMB','ONE_50P_LAMB','TWO_50P_LAMB','TWO_50P_2X_LAMB','ONE_20P_2X_LAMB',FLEX_KIND,PILOT_KIND,EARLY_KIND)
                 lastStage=('trigger1000,sold3,sold5,sold1000,soldQty3,soldQty5,soldQty1000'
                            if sacrificial else 'trigger10,sold3,sold5,sold10,soldQty3,soldQty5,soldQty10')
                 if sacrificial:
@@ -132,6 +133,15 @@ def snapshot(directory,now=None):
                 out['positions']=rows(ex,'''SELECT selectionId,token,originalQty,boughtAt,
                   bestGbp,lastCheck,'''+stageColumns+
                   ''',error FROM positions ORDER BY boughtAt DESC''')
+                if configured:
+                    for p in out['positions']:
+                        p['exitSlices']=rows(ex,
+                            "SELECT stage,multiple,percent,triggered,sold,soldQty "
+                            "FROM exit_slices WHERE selectionId=? ORDER BY stage",
+                            (p['selectionId'],))
+                    out['saleStageLabels']={
+                        (r['selectionId'],r['stage']):r['multiple']
+                        for r in rows(ex,"SELECT selectionId,stage,multiple FROM exit_slices")}
                 out['selectionCounts']={r['status']:r['count'] for r in rows(ex,
                     'SELECT status,COUNT(*) count FROM selections GROUP BY status')}
                 out['selectionCounts']['SKIPPED_V3']=value(ex,
@@ -145,7 +155,7 @@ def snapshot(directory,now=None):
                 # Confirmed real sale ledger. WETH receipts are verified
                 # transfer amounts; native ETH outputs are NOT derivable from
                 # the existing SQLite receipts, and must remain unmeasured.
-                out['sales']=rows(ex,'''SELECT s.stage,s.txHash,s.tokenDebited,
+                out['sales']=rows(ex,'''SELECT s.selectionId,s.stage,s.txHash,s.tokenDebited,
                      s.wethReceivedWei,s.confirmedAt,p.token
                      FROM sales s LEFT JOIN positions p ON p.selectionId=s.selectionId
                      ORDER BY s.confirmedAt DESC''')
@@ -185,6 +195,10 @@ def snapshot(directory,now=None):
                 out['summary']=dict(cap=cap,bought=bought,buyGbp=buy,
                     campaignKind=meta.get('campaignKind'),
                     sacrifice=sacrificial,newLadder=newLadder,pilotMode=pilot,earlyMode=early,
+                    configured=configured,financeMode=pilot or configured,
+                    probeGbp=money(meta.get('probeGbp')) or Decimal('.01'),
+                    probeWaitUnit=meta.get('probeWaitUnit','blocks' if meta.get('waitBlocks') else 'seconds'),
+                    probeWaitValue=number(meta.get('probeWaitValue'),500 if meta.get('waitBlocks') else 10),
                     probeWaitBlocks=number(meta.get('waitBlocks'),0),
                     probesConfirmed=value(ex,"SELECT COUNT(*) FROM lamb_probes WHERE confirmedAt IS NOT NULL")
                         if sacrificial else 0,
@@ -204,7 +218,11 @@ def snapshot(directory,now=None):
                          for p in out['positions']),
                     sales=len(out['sales']),txStates=byTx,
                     proceedsWeth=proceeds,unmeasuredSales=unmeasured)
-                if pilot:
+                if configured:
+                    out['summary']['open']=sum(not p.get('exitSlices') or
+                        any(not stage['sold'] for stage in p['exitSlices'])
+                        for p in out['positions'])
+                if pilot or configured:
                     finance=(rows(ex,"""SELECT f.txHash,f.kind,f.expenseWei,f.gasWei,f.incomeWei,
                         f.incomeAsset,f.incomeBasis,f.fxGbpPerEth,f.fxAt,f.state,f.reason
                         FROM finance_events f JOIN transactions t
@@ -311,12 +329,12 @@ def card_summary(view):
 
 def card_lamb(view):
     s=view['summary']
-    buyLabel=('£'+str(s['buyGbp']) if s.get('campaignKind') in (FLEX_KIND,PILOT_KIND,EARLY_KIND) else
+    buyLabel=('£'+str(s['buyGbp']) if s.get('configured') or s.get('campaignKind') in (FLEX_KIND,PILOT_KIND,EARLY_KIND) else
               '20P' if s.get('buyGbp')==Decimal('0.20') else
               '50P' if s.get('buyGbp')==Decimal('0.50') else '10P')
     grid=Table.grid(expand=True,padding=(0,2))
     for _ in range(5):grid.add_column(ratio=1,justify='center')
-    grid.add_row('[cyan]CONFIRMED 1P[/cyan]','[cyan]FAILED[/cyan]',
+    grid.add_row('[cyan]CONFIRMED SACRIFICES[/cyan]','[cyan]FAILED[/cyan]',
                  '[cyan]UNKNOWN[/cyan]','[cyan]SURVIVED[/cyan]',
                  '[cyan]'+buyLabel+' FILLS[/cyan]')
     grid.add_row(str(s['probesConfirmed']),str(s['probesFailed']),str(s['probesUnknown']),
@@ -324,13 +342,13 @@ def card_lamb(view):
     grid.add_row('[cyan]PROBE SPENT[/cyan]','[cyan]INTAKE[/cyan]',
                  '[cyan]SOURCES[/cyan]','[cyan]HELD VENUES[/cyan]',
                  '[cyan]'+buyLabel+' SPENT[/cyan]')
-    grid.add_row('£'+str(Decimal('.01')*s['probesConfirmed']),s['intakeState'],
+    grid.add_row('£'+str(s.get('probeGbp',Decimal('.01'))*s['probesConfirmed']),s['intakeState'],
                  s['workerState'],s['watcherState'],f"£{s['committed']:.2f}")
     t=Table(expand=True,box=box.SIMPLE,show_edge=False,padding=(0,1))
     for name in ('TOKEN','PROBE','GATE','REASON'):t.add_column(name,no_wrap=True)
     for p in view['probes'][:5]:
         if p['status']=='PROBE_CONFIRMED':
-            if s.get('probeWaitBlocks')==500:
+            if s.get('probeWaitUnit')=='blocks':
                 try:
                     chainHead=int(str(view['detector']['head']),0)
                     if chainHead < 0:raise ValueError('invalid head')
@@ -341,13 +359,13 @@ def card_lamb(view):
                 if start is None:
                     gate='RECEIPT BLOCK UNKNOWN'
                 elif chainHead is None:
-                    gate='WAIT 500 BLOCKS • HEAD UNKNOWN'
+                    gate='WAIT '+str(s.get('probeWaitValue',500))+' BLOCKS • HEAD UNKNOWN'
                 else:
-                    remaining=max(0,start+500-chainHead)
+                    remaining=max(0,start+s.get('probeWaitValue',500)-chainHead)
                     gate=(str(remaining)+' blocks left (detector)'
                           if remaining else 'CHECK DUE (detector head)')
             else:
-                seconds=max(0,int(float(p['confirmedAt'])+10-view['now']+0.999))
+                seconds=max(0,int(float(p['confirmedAt'])+s.get('probeWaitValue',10)-view['now']+0.999))
                 gate=(str(seconds)+'s left') if seconds else 'CHECK DUE'
         elif p['passedAt'] is not None or p['status'] in ('QUEUED','BUY_PENDING','BOUGHT'):
             gate='PASSED'
@@ -366,7 +384,11 @@ def card_positions(view):
     lamb=bool(view['summary'].get('sacrifice'))
     newLadder=bool(view['summary'].get('newLadder'))
     pilot=bool(view['summary'].get('pilotMode'))
-    columns=([('1.5× 80%',{}),('3× 20%',{})] if view['summary'].get('earlyMode') else
+    configured=bool(view['summary'].get('configured'))
+    configuredStages=(view['positions'][0].get('exitSlices',[]) if configured and view['positions'] else [])
+    columns=([(str(stage['multiple'])+'× '+str(stage['percent'])+'%',{})
+              for stage in configuredStages] if configured else
+              [('1.5× 80%',{}),('3× 20%',{})] if view['summary'].get('earlyMode') else
               [('3× 80%',{}),('5× 20%',{})] if pilot else
               [('2× 80%',{}),('50× 10%',{}),('100× 5%',{})]
              if newLadder else
@@ -381,17 +403,20 @@ def card_positions(view):
         best=money(p['bestGbp'])
         multiple=best/buy if best is not None and buy>0 else None
         original=number(p['originalQty'])
-        sold=sum(number(p['soldQty'+str(x)]) for x in (3,5,10))+number(p.get('manualSold'))
+        sold=(sum(number(x['soldQty']) for x in p.get('exitSlices',[]))
+              if configured else sum(number(p['soldQty'+str(x)]) for x in (3,5,10))+number(p.get('manualSold')))
         percent=Decimal(sold)*100/original if original else None
         t.add_row(p['token'],age(p['boughtAt'],view['now']),
             f'£{best:.2f}' if best is not None else '—',
             f'{multiple:.2f}×' if multiple is not None else '—',
-            mark(p['trigger3'],p['sold3']),mark(p['trigger5'],p['sold5']),
-            *([] if pilot else [mark(p['trigger10'],p['sold10'])]),
+            *([mark(x['triggered'],x['sold']) for x in p.get('exitSlices',[])]
+              if configured else
+              [mark(p['trigger3'],p['sold3']),mark(p['trigger5'],p['sold5']),
+               *([] if pilot else [mark(p['trigger10'],p['sold10'])])]),
             f'{percent:.1f}%' if percent is not None else '—',
             age(p['lastCheck'],view['now']),
             style='red' if p['error'] else None)
-    if not view['positions']:t.add_row('No confirmed buys',*(['—']*(7 if pilot else 8)))
+    if not view['positions']:t.add_row('No confirmed buys',*(['—']*(5+len(columns))))
     return panel('POSITIONS • BEST = HISTORICAL FULL-SIZE SELL QUOTE, NOT CURRENT WALLET VALUE',t)
 
 
@@ -408,7 +433,7 @@ def card_proceeds(view):
     t.add_column('TOKEN',no_wrap=True)
     t.add_column('EXIT',no_wrap=True)
     t.add_column('ACTUAL RECEIVED',justify='right',no_wrap=True)
-    pilot=view['summary'].get('pilotMode')
+    pilot=view['summary'].get('financeMode')
     if pilot:t.add_column('GBP EQUIVALENT',justify='right',no_wrap=True)
     for sale in sales[:6]:
         finance=view.get('financeByHash',{}).get(sale['txHash'].lower()) if pilot else None
@@ -423,7 +448,10 @@ def card_proceeds(view):
         else:
             gbp='[yellow]UNMEASURED[/yellow]'
         t.add_row(age(sale['confirmedAt'],view['now']),sale['token'],
-                  ({'3':'1.5×','5':'3×'}.get(str(sale['stage']),str(sale['stage'])+'×')
+                  ((str(view.get('saleStageLabels',{}).get(
+                         (sale.get('selectionId'),sale['stage']),sale['stage']))+'×')
+                    if view['summary'].get('configured') and isinstance(sale['stage'],int)
+                    else {'3':'1.5×','5':'3×'}.get(str(sale['stage']),str(sale['stage'])+'×')
                     if view['summary'].get('earlyMode') and isinstance(sale['stage'],int)
                     else str(sale['stage'])+'×' if isinstance(sale['stage'],int)
                     else 'MANUAL'),received,*([gbp] if pilot else []))
