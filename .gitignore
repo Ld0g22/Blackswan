@@ -12,3 +12,10 @@ __pycache__/
 .pytest_cache/
 .coverage
 .DS_Store
+
+# Build One: additional protection because this repository is public.
+wallet.json
+wallet*.json
+*keystore*.json
+treasury*.json
+secrets/
