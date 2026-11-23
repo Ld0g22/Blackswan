@@ -1,0 +1,29 @@
+name: Build Two — restored peak tracking and threshold execution
+
+on:
+  push:
+    branches: [main, build/two-peak-execution]
+  pull_request:
+
+jobs:
+  restored-execution:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install frozen historical dependencies
+        run: |
+          python -m pip install --requirement requirements.txt
+          python -m pip install --requirement requirements_live.txt
+      - name: Compile original modules and tests
+        run: python -m compileall -q detector.py peak_tracker.py execution_peak_routes.py swap_adapters.py live_executor.py wallet_transactions.py broadcast_rpc.py campaign_config.py campaign_finance.py sacrificial_lamb.py probe_buying_blocks.py held_venue_watch.py manual_exit_engine.py manual_sale.py run_live_campaign.py five_second_selector.py research/venue_decoders.py
+      - name: Original offline peak/route/execution/sacrifice regression suites
+        run: |
+          python -m unittest -q             test_peak_tracker test_usdg_routes test_live_execution             test_original_peak_execution test_v4_selected_v3_v4_execution             test_v4_staged_sale test_live_abi test_two_way_exit_gate             test_broadcast_rpc test_eip1559_fees test_sell_retry_pacing             test_preapproval_recovery test_smoke_roundtrip test_no_pons_execution             test_sacrificial_lamb test_sacrificial_integration             test_sacrificial_shutdown test_manual_sale test_flex_campaign             test_early_1p5x3x test_probe_buying_blocks test_pilot_3x5x             test_held_venue_watch test_flex_launcher test_build_two_selector_contract
+      - name: Build One detector and standards regression
+        run: |
+          python -m unittest -q test_detector
+          python -m unittest discover -s tests -q
