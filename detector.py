@@ -316,6 +316,8 @@ class EventJournal:
                 "bySource": counts, "estimatedCu24h": round(self.recentCu(), 1),
                 "lastObservationUtc": last[0] if last else None,
                 "lastConnectedHead": self.getMeta("lastConnectedHead", "none"),
+                "lastBackfilledHead": self.getMeta("lastBackfilledHead", "none"),
+                "recoveryStatus": self.getMeta("recoveryStatus", "UNKNOWN"),
                 "reportedGaps": gapCount, "decodeFailures": decodeFailureCount}
 
     def close(self) -> None:
@@ -418,6 +420,7 @@ class Detector:
                   f"block={event['blockNumber']} {suffix} tx={event['transactionHash'][:12]}…", flush=True)
 
     async def recover(self, session: aiohttp.ClientSession, targetHead: int) -> None:
+        self.journal.setMeta("recoveryStatus", "IN_PROGRESS")
         previous = self.journal.getMeta("lastConnectedHead")
         if previous:
             originalStart = max(0, int(previous) - RECONNECT_OVERLAP_BLOCKS)
@@ -428,6 +431,7 @@ class Detector:
             self.journal.addGap(originalStart, start - 1, "outside-fast-recovery-window")
             print(f"WARN unrecovered stale range {originalStart}..{start - 1}; live detection continues", flush=True)
         if start > targetHead:
+            self.journal.setMeta("recoveryStatus", "COMPLETE")
             return
         print(f"RECOVER {start}..{targetHead} (live feed continues)", flush=True)
         current = start
@@ -490,11 +494,14 @@ class Detector:
                 await asyncio.sleep(RECOVERY_SPACING_SECONDS)
                 current = end + 1
             self.journal.setMeta("lastBackfilledHead", str(targetHead))
+            self.journal.setMeta("recoveryStatus", "COMPLETE")
             print(f"RECOVER complete through block {targetHead}", flush=True)
         except asyncio.CancelledError:
+            self.journal.setMeta("recoveryStatus", "INCOMPLETE")
             self.journal.addGap(current, targetHead, "recovery-cancelled")
             raise
         except (RuntimeError, BudgetExceeded, ValueError, TypeError, KeyError) as error:
+            self.journal.setMeta("recoveryStatus", "INCOMPLETE")
             self.journal.addGap(current, targetHead, f"recovery-interrupted:{type(error).__name__}")
             print(f"WARN recovery interrupted at block {current}; range recorded as gap", flush=True)
             if isinstance(error, BudgetExceeded):
@@ -592,7 +599,8 @@ class Detector:
             self.journal.pruneUsage()
             info = self.journal.stats()
             print(f"HEALTH {info['status']} events={info['events']} "
-                  f"cu24h~={info['estimatedCu24h']} gaps={info['reportedGaps']} "
+                  f"cu24h~={info['estimatedCu24h']} recovery={info['recoveryStatus']} "
+                  f"gaps={info['reportedGaps']} "
                   f"decodeErrors={info['decodeFailures']}", flush=True)
 
     async def run(self) -> None:
