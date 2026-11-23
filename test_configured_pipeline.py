@@ -75,6 +75,64 @@ class ConfiguredFullPipelineTests(unittest.IsolatedAsyncioTestCase):
             "UPDATE transactions SET state='CONFIRMED',receipt=? WHERE selectionId=? AND kind=?",
             (json.dumps(data),self.sid,kind))
 
+    async def test_temporary_rpc_429_during_sacrifice_can_recover_within_deadline(self):
+        old=self.routes.verifiedBuyCandidates
+        async def unavailable(token,amount):
+            raise RuntimeError("RPC_HTTP_429")
+        self.routes.verifiedBuyCandidates=unavailable
+        await self.engine.lamb.start(self.selection())
+        self.assertEqual(self.selection()["status"],"LAMB_QUEUED")
+        self.assertFalse(self.tx.orders)
+        self.routes.verifiedBuyCandidates=old
+        self.store.set("probeRetryAfter:"+self.sid,"0")
+        await self.engine.lamb.start(self.selection())
+        self.assertEqual(self.selection()["status"],"PROBE_PENDING")
+        self.assertEqual(len(self.tx.orders),1)
+
+    async def test_temporary_rpc_429_during_main_buy_keeps_queued_then_recovers(self):
+        self.store.db.execute("UPDATE selections SET status='QUEUED' WHERE selectionId=?",(self.sid,))
+        self.store.db.execute("""INSERT INTO lamb_probes(
+             selectionId,token,probeTxHash,confirmedAt,probeQty,probeInputWei,passedAt,result)
+             VALUES(?,?,?,1,'10','1',?,'PROBE_PASSED')""",
+             (self.sid,TOKEN,'0x'+'8'*64,time.time()))
+        old=self.routes.verifiedBuyCandidates
+        async def unavailable(token,amount):
+            raise RuntimeError("RPC_HTTP_429")
+        self.routes.verifiedBuyCandidates=unavailable
+        await self.engine.buy(self.selection())
+        self.assertEqual(self.selection()["status"],"QUEUED")
+        self.assertFalse(self.tx.orders)
+        self.routes.verifiedBuyCandidates=old
+        self.store.set("buyRetryAfter:"+self.sid,"0")
+        await self.engine.buy(self.selection())
+        self.assertEqual(self.selection()["status"],"BUY_PENDING")
+        self.assertEqual(self.tx.orders,[("BUY",100_000_000_000_000)])
+
+    async def test_temporary_missing_survival_sell_route_does_not_discard_survivor(self):
+        await self.engine.lamb.start(self.selection())
+        self.confirm("PROBE_BUY",10)
+        await self.engine.reconcileReceipts()
+        self.store.db.execute("UPDATE lamb_probes SET confirmedAt=? WHERE selectionId=?",
+                              (time.time()-2,self.sid))
+        self.routes.failSell=True
+        await self.engine.lamb.check(self.selection())
+        self.assertEqual(self.selection()["status"],"PROBE_CONFIRMED")
+        self.routes.failSell=False
+        self.store.db.execute("UPDATE lamb_probes SET lastCheck=lastCheck-4 WHERE selectionId=?",
+                              (self.sid,))
+        await self.engine.lamb.check(self.selection())
+        self.assertEqual(self.selection()["status"],"QUEUED")
+
+    async def test_sacrifice_budget_cannot_create_another_signed_intent(self):
+        self.store.configuredCampaign["limits"]["maxSacrifices"]=1
+        self.store.db.execute("""INSERT INTO transactions(
+            intentId,selectionId,kind,state,txHash,raw,nonce,createdAt,lastBroadcast,inputAmount)
+            VALUES('unrelated','other','PROBE_BUY','SENT',?,'0x',0,1,1,'10')""",
+            ('0x'+'b'*64,))
+        await self.engine.lamb.start(self.selection())
+        self.assertEqual(self.selection()["status"],"PROBE_FAILED")
+        self.assertEqual(self.tx.orders,[])
+
     async def test_two_stage_real_receipt_ledger_and_probe_retained(self):
         self.assertEqual(self.selection()["status"],"LAMB_QUEUED")
         await self.engine.lamb.start(self.selection())
