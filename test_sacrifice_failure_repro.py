@@ -36,6 +36,10 @@ class SacrificeRequiredBehavior(unittest.IsolatedAsyncioTestCase):
                 "A temporary quote RPC_429 discarded the survivor from the scheduler",
             )
             case.routes.verifiedBuyCandidates = good
+            # Simulate the bounded retry time elapsing.
+            case.store.db.execute(
+                "UPDATE lamb_probes SET lastCheck=lastCheck-4 WHERE selectionId=?",
+                (case.selectionId,))
             await case.gate.check(case.selection())
             self.assertEqual(case.status(), "QUEUED")
         finally:

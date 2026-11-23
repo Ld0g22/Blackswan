@@ -181,7 +181,7 @@ class TestProbe500BlockGate(unittest.IsolatedAsyncioTestCase):
         self.rpc.head=510
         self.routes.block='0x1fd'
         await self.gate.check(self.selection())
-        self.assertEqual(self.status(),'PROBE_UNKNOWN')
+        self.assertEqual(self.status(),'PROBE_CONFIRMED')  # retryable stale quote, no main purchase
         self.assertEqual(len(self.owner.tx.signed),1)
 
     async def test_no_sell_route_prevents_10p(self):
