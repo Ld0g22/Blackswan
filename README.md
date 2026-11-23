@@ -57,3 +57,10 @@ python3 -m unittest discover -s tests -v
 ```
 
 `tools/check_terminal_commands.py` accepts the Markdown file containing proposed user-facing shell commands. Example: `python3 tools/check_terminal_commands.py proposed_commands.md`. It catches shell-terminating constructs, but cannot prove arbitrary shell commands are safe: code review remains essential.
+
+
+## Build One — detector (23 November 2026)
+
+The first proposed engineering build is the read-only Robinhood launch detector, on branch [`build/one-detector`](https://github.com/Ld0g22/Blackswan/tree/build/one-detector), with its preserved upstream regressions plus targeted atomicity and recovery-health corrections. It is **not** a selector, execution engine, wallet integration or live campaign.
+
+Read [`docs/BUILD_ONE_DETECTOR.md`](docs/BUILD_ONE_DETECTOR.md) for upstream commit, contract, test evidence and verification gaps. `DETECTOR_README.md` is the preserved historical detector manual; the Build One document governs post-import changes and readiness. **Passing local CI does not establish live network coverage.**
