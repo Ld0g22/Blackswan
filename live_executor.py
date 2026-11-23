@@ -450,6 +450,20 @@ class ExecutionStore:
                     'sold1000':bool(r['sold1000']),'error':r['error']}
                     for r in self.db.execute("""SELECT token,bestGbp,trigger3,trigger5,trigger1000,
                         sold3,sold5,sold1000,error FROM positions ORDER BY boughtAt DESC LIMIT 6""")]
+        if self.configuredCampaign is not None:
+            base['openPositions']=self.db.execute("""SELECT COUNT(*) FROM positions p WHERE NOT EXISTS
+                (SELECT 1 FROM exit_slices e WHERE e.selectionId=p.selectionId GROUP BY e.selectionId
+                 HAVING COUNT(*)=SUM(e.sold))""").fetchone()[0]
+            base['positions']=[{
+                "token":r["token"],"bestGbp":r["bestGbp"],"error":r["error"],
+                "exitSlices":[dict(x) for x in self.db.execute(
+                    "SELECT stage,multiple,percent,triggered,sold,soldQty FROM exit_slices "
+                    "WHERE selectionId=? ORDER BY stage",(r["selectionId"],))]
+            } for r in self.db.execute(
+                "SELECT selectionId,token,bestGbp,error FROM positions ORDER BY boughtAt DESC LIMIT 6")]
+            base["configuredCampaignIdentity"]=self.get("campaignIdentity")
+            base["probeNominalGbp"]=str(self.probeGbp*base.get("probesConfirmed",0))
+            base["probeMaxBudget"]=self.configuredCampaign["limits"]
         return base
 
 
@@ -487,11 +501,18 @@ class LiveExecutor:
         self.stages=(((3,80),(5,20)) if store.flexPilot else
                      ((2,80),(50,10),(100,5)) if store.newLadder2x else
                      ((3,80),(5,10),(1000,10)) if store.sacrifice else STAGES)
+        if store.configuredCampaign is not None:
+            self.stages=tuple((i,Decimal(item["percent"]))
+                              for i,item in enumerate(store.configuredCampaign["exits"],1))
+            self.exitThresholds={i:Decimal(item["multiple"])
+                                 for i,item in enumerate(store.configuredCampaign["exits"],1)}
+            for existing in store.db.execute("SELECT selectionId FROM positions").fetchall():
+                store.seedExitStages(existing["selectionId"])
         self.lamb=LambGate(self,receiptTransfers,waitBlocks=store.probeWaitBlocks) if store.sacrifice else None
         self.venueWatcher=HeldVenueWatcher(self) if store.sacrifice else None
         self.lastVenueCheck=0.0
         self.manual=ManualExitEngine(self,receiptTransfers) if (store.oneFifty or store.twoFifty or store.oneTwenty2x or store.flexLamb) else None
-        self.finance=CampaignFinance(store,rpc,fx,tx.account.address) if store.flexPilot else None
+        self.finance=CampaignFinance(store,rpc,fx,tx.account.address) if (store.flexPilot or store.configuredCampaign is not None) else None
 
     def ponsOrigin(self,token):
         """Read the unchanged detector journal; deny even reorg-removed Pons evidence.
@@ -703,8 +724,13 @@ class LiveExecutor:
             if (deadlineStart is None or row['status']!='QUEUED' or
                     self.store.get('intakeState','OPEN')!='OPEN'):
                 return
-        if time.time()-deadlineStart>BUY_LAG_LIMIT:
+        if time.time()-deadlineStart>self.store.entryDeadlineSeconds:
             self.store.db.execute("UPDATE selections SET status='SKIPPED',reason='MISSED_ENTRY_DEADLINE' WHERE selectionId=?",(selectionId,))
+            return
+        if not self.store.canSpend("BUY"):
+            self.store.db.execute(
+                "UPDATE selections SET status='SKIPPED',reason='MAIN_BUDGET_LIMIT' WHERE selectionId=? AND status='QUEUED'",
+                (selectionId,))
             return
         try:
             rate=await self.fx.get()
@@ -720,7 +746,7 @@ class LiveExecutor:
                   'sellSource',quote.get('preBuySellSource'),
                   'peakSelectedRoute',quote.get('peakRoute'),
                   'block',quote.get('preBuySellBlock'),flush=True)
-            if time.time()-deadlineStart>BUY_LAG_LIMIT:
+            if time.time()-deadlineStart>self.store.entryDeadlineSeconds:
                 raise RuntimeError('MISSED_ENTRY_DEADLINE')
             # The detector's journal is not a lifetime registry. Verify the
             # token against the actual Pons V2 factory before ANY order is signed.
@@ -732,7 +758,7 @@ class LiveExecutor:
                     (originReason,selectionId))
                 print('EXECUTION BUY EXCLUDED SKIPPED_PONS',originReason,token,flush=True)
                 return
-            if time.time()-deadlineStart>BUY_LAG_LIMIT:
+            if time.time()-deadlineStart>self.store.entryDeadlineSeconds:
                 raise RuntimeError('MISSED_ENTRY_DEADLINE')
             transaction=self.swaps.build(quote,amountWei,self.tx.account.address)
             # Intent ID is selection-derived and durable across restart.
@@ -744,7 +770,7 @@ class LiveExecutor:
                             self.store.get('intakeState','OPEN')!='OPEN' or
                             (self.store.flexLamb and self.store.acquired()+self.store.reserved()>self.store.purchaseLimit) or
                             lamb.revoked(selectionId) or
-                            time.time()-deadlineStart>BUY_LAG_LIMIT):
+                            time.time()-deadlineStart>self.store.entryDeadlineSeconds):
                         return
                 if lamb is not None and lamb.activity is not None:
                     try:
@@ -771,7 +797,7 @@ class LiveExecutor:
         except (RuntimeError,ValueError) as exc:
             reason=str(exc)
             # Busy wallet may recover within the original 3-second deadline.
-            if reason=='WALLET_TRANSACTION_IN_FLIGHT' and time.time()-deadlineStart<BUY_LAG_LIMIT:
+            if reason=='WALLET_TRANSACTION_IN_FLIGHT' and time.time()-deadlineStart<self.store.entryDeadlineSeconds:
                 return
             self.store.db.execute("UPDATE selections SET status='SKIPPED',reason=? WHERE selectionId=?",
                                   (reason[:160],selectionId))
@@ -815,6 +841,8 @@ class LiveExecutor:
                            VALUES(?,?,?,?,?,NULL,?,?)''',
                            (row['selectionId'],selected['token'],str(qty),row['inputAmount'],now,now,now))
                         self.store.db.execute("UPDATE selections SET status='BOUGHT' WHERE selectionId=?",(row['selectionId'],))
+                        if self.store.configuredCampaign is not None:
+                            self.store.seedExitStages(row['selectionId'])
                         if getattr(self.store,'sacrifice',False) and self.store.acquired()>=self.store.purchaseLimit:
                             self.store.set('intakeState','CLOSED')
                             self.store.set('intakeClosedAt',now)
@@ -834,7 +862,9 @@ class LiveExecutor:
                     position=self.store.db.execute('SELECT * FROM positions WHERE selectionId=?',(row['selectionId'],)).fetchone()
                     if not position:continue
                     stage=int(row['kind'].split('_')[1])
-                    if position['sold'+str(stage)]:continue
+                    if (self.store.stageRow(row['selectionId'],stage)['sold']
+                            if self.store.configuredCampaign is not None
+                            else position['sold'+str(stage)]):continue
                     if row['state']=='REVERTED':
                         # Revert uses a nonce, but it spent zero tokens. Retry from a new quote.
                         continue
@@ -848,7 +878,14 @@ class LiveExecutor:
                     wethOut=max(0,receiptTransfers(receipt,WETH,self.tx.account.address))
                     self.store.db.execute('BEGIN IMMEDIATE')
                     try:
-                        self.store.db.execute(f'UPDATE positions SET sold{stage}=1,soldQty{stage}=?,error=NULL WHERE selectionId=?',(str(debited),row['selectionId']))
+                        if self.store.configuredCampaign is not None:
+                            self.store.db.execute(
+                                "UPDATE exit_slices SET sold=1,soldQty=? WHERE selectionId=? AND stage=?",
+                                (str(debited),row['selectionId'],stage))
+                            self.store.db.execute("UPDATE positions SET error=NULL WHERE selectionId=?",
+                                                  (row['selectionId'],))
+                        else:
+                            self.store.db.execute(f'UPDATE positions SET sold{stage}=1,soldQty{stage}=?,error=NULL WHERE selectionId=?',(str(debited),row['selectionId']))
                         self.store.db.execute('''INSERT OR IGNORE INTO sales
                              (selectionId,stage,txHash,tokenDebited,wethReceivedWei,confirmedAt)
                              VALUES(?,?,?,?,?,?)''',
@@ -896,6 +933,24 @@ class LiveExecutor:
         except (RuntimeError,ValueError) as exc:
             print('EARLY SELL APPROVAL RETRY',token,str(exc)[:160],flush=True)
 
+    def configuredSlice(self,position,stage,tradable):
+        """Size by original receipt-confirmed position; never spend probe tokens."""
+        selectionId=position['selectionId']
+        original=int(position['originalQty'])
+        stageInfo=self.store.stageRow(selectionId,stage)
+        if stageInfo is None:
+            raise RuntimeError("CONFIGURED_EXIT_STAGE_MISSING")
+        if stage==len(self.stages):
+            sold=sum(int(row['soldQty']) for row in
+                self.store.db.execute(
+                    "SELECT soldQty FROM exit_slices WHERE selectionId=? AND sold=1",
+                    (selectionId,)))
+            target=max(0,original-sold)
+        else:
+            target=int((Decimal(original)*Decimal(stageInfo['percent'])/Decimal(100))
+                       .to_integral_value(rounding=ROUND_DOWN))
+        return max(0,target)
+
     async def prepareSell(self,position):
         selectionId=position['selectionId'];token=position['token']
         manual=getattr(self,'manual',None)
@@ -909,7 +964,12 @@ class LiveExecutor:
         retryKey='sellRetryAfter:'+selectionId
         if time.time()<float(self.store.get(retryKey,'0')):
             return
-        stage=next((x for x,_ in getattr(self,'stages',STAGES) if position['trigger'+str(x)] and not position['sold'+str(x)]),None)
+        if self.store.configuredCampaign is not None:
+            stage=next((x for x,_ in self.stages
+                        if (r:=self.store.stageRow(selectionId,x))
+                        and r['triggered'] and not r['sold']),None)
+        else:
+            stage=next((x for x,_ in getattr(self,'stages',STAGES) if position['trigger'+str(x)] and not position['sold'+str(x)]),None)
         if stage is None:return
         kind='SELL_'+str(stage)
         if self.pendingFor(selectionId,kind):return
@@ -919,7 +979,9 @@ class LiveExecutor:
             original=int(position['originalQty']);balance=await self.balance(token)
             lamb=getattr(self,'lamb',None)
             tradable=max(0,balance-lamb.probeQuantity(selectionId)) if lamb else balance
-            amount=(manual.autoSlice(position,stage,tradable)
+            amount=(self.configuredSlice(position,stage,tradable)
+                    if self.store.configuredCampaign is not None else
+                    manual.autoSlice(position,stage,tradable)
                     if manual and (self.store.newLadder2x or self.store.flexPilot or manual.hasManualFills(selectionId))
                     else checkSlice(original,stage,tradable,
                                     int(position['soldQty3']),int(position['soldQty5']),
@@ -976,8 +1038,21 @@ class LiveExecutor:
             old=Decimal(position['bestGbp'] or '0')
             growth=value>old
             lastGrowth=now if growth else position['lastGrowth']
-            triggers={stage:1 if multiple>=getattr(self,'exitThresholds',{}).get(stage,Decimal(stage)) else position['trigger'+str(stage)] for stage,_ in getattr(self,'stages',STAGES)}
-            if self.store.flexPilot:
+            triggers=({stage:1 if multiple>=getattr(self,'exitThresholds',{}).get(stage,Decimal(stage)) else position['trigger'+str(stage)]
+                       for stage,_ in getattr(self,'stages',STAGES)}
+                      if self.store.configuredCampaign is None else {})
+            if self.store.configuredCampaign is not None:
+                self.store.seedExitStages(position['selectionId'])
+                for stage,_ in self.stages:
+                    if multiple>=self.exitThresholds[stage]:
+                        self.store.db.execute(
+                            "UPDATE exit_slices SET triggered=1 WHERE selectionId=? AND stage=?",
+                            (position['selectionId'],stage))
+                self.store.db.execute(
+                    "UPDATE positions SET bestGbp=?,lastGrowth=?,lastCheck=?,nextDue=? WHERE selectionId=?",
+                    (str(value) if growth else position['bestGbp'],
+                     lastGrowth,now,now+nextInterval(lastGrowth,now),position['selectionId']))
+            elif self.store.flexPilot:
                 self.store.db.execute('''UPDATE positions SET bestGbp=?,lastGrowth=?,lastCheck=?,nextDue=?,
                          trigger3=?,trigger5=? WHERE selectionId=?''',
                     (str(value) if growth else position['bestGbp'],lastGrowth,now,
@@ -1032,7 +1107,9 @@ class LiveExecutor:
     async def run(self):
         assert int(await self.rpc.call('eth_chainId',[]),16)==4663
         await self.fx.get()  # Cache FX before first five-second selector decision.
-        title=('BLACK SWAN 3 | FLEX '+str(self.store.purchaseLimit)+' x GBP '+str(self.store.buyGbp)+' | 80% 1.5x / 20% 3x / NO RESERVE'
+        title=('BLACK SWAN CONFIGURED V3 | '+str(self.store.purchaseLimit)+' x GBP '+str(self.store.buyGbp)
+               +' | '+str(self.store.configuredCampaign['exits']) if self.store.configuredCampaign else
+               'BLACK SWAN 3 | FLEX '+str(self.store.purchaseLimit)+' x GBP '+str(self.store.buyGbp)+' | 80% 1.5x / 20% 3x / NO RESERVE'
                if self.store.flexEarly else
                'BLACK SWAN 3 | FLEX '+str(self.store.purchaseLimit)+' x GBP '+str(self.store.buyGbp)+' | 80% 3x / 20% 5x / NO RESERVE'
                if self.store.flexPilot else
@@ -1059,7 +1136,10 @@ class LiveExecutor:
             # A latched threshold creates an urgent sale obligation. Launch
             # those exits before any fresh buy can take the wallet nonce.
             positions=self.store.db.execute(
-                ("SELECT * FROM positions WHERE sold100=0 ORDER BY boughtAt" if self.store.newLadder2x
+                ("SELECT p.* FROM positions p WHERE EXISTS ("
+                 "SELECT 1 FROM exit_slices e WHERE e.selectionId=p.selectionId AND e.sold=0)"
+                 " ORDER BY p.boughtAt" if self.store.configuredCampaign is not None
+                 else "SELECT * FROM positions WHERE sold100=0 ORDER BY boughtAt" if self.store.newLadder2x
                  else "SELECT * FROM positions WHERE sold1000=0 ORDER BY boughtAt" if self.lamb
                  else "SELECT * FROM positions WHERE sold10=0 ORDER BY boughtAt")).fetchall()
             urgentExit=False
@@ -1069,8 +1149,11 @@ class LiveExecutor:
                 if position['nextDue']<=now:
                     self.spawn('QUOTE:'+position['selectionId'],
                                self.checkPosition(position))
-                triggered=any(position['trigger'+str(stage)] and
-                              not position['sold'+str(stage)]
+                triggered=any((self.store.stageRow(position['selectionId'],stage)['triggered']
+                               and not self.store.stageRow(position['selectionId'],stage)['sold'])
+                              if self.store.configuredCampaign is not None
+                              else (position['trigger'+str(stage)] and
+                                    not position['sold'+str(stage)])
                               for stage,_ in self.stages)
                 if triggered:
                     urgentExit=True
@@ -1085,7 +1168,9 @@ class LiveExecutor:
                     if self.manual and (self.manual.active(position['selectionId'])
                                         or self.manual.mainRemaining(position)<=0):
                         continue
-                    if (not any(position['trigger'+str(stage)] for stage,_ in self.stages)
+                    if (not any((self.store.stageRow(position['selectionId'],stage)['triggered'])
+                                if self.store.configuredCampaign is not None else
+                                position['trigger'+str(stage)] for stage,_ in self.stages)
                             and position['preApprovalNext']<=now):
                         approvalDue=True
                         self.spawn('APPROVE:'+position['selectionId'],
