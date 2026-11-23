@@ -114,10 +114,10 @@ class ConfiguredFullPipelineTests(unittest.IsolatedAsyncioTestCase):
         await self.engine.reconcileReceipts()
         self.store.db.execute("UPDATE lamb_probes SET confirmedAt=? WHERE selectionId=?",
                               (time.time()-2,self.sid))
-        self.routes.failSell=True
+        self.routes.fail=True
         await self.engine.lamb.check(self.selection())
         self.assertEqual(self.selection()["status"],"PROBE_CONFIRMED")
-        self.routes.failSell=False
+        self.routes.fail=False
         self.store.db.execute("UPDATE lamb_probes SET lastCheck=lastCheck-4 WHERE selectionId=?",
                               (self.sid,))
         await self.engine.lamb.check(self.selection())
