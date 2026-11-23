@@ -290,7 +290,8 @@ class LambGate:
         now=time.time()
         # Fail-closed, but retry temporary provider/quote outages. A previous
         # PROBE_UNKNOWN terminal state silently discarded valid survivors.
-        if probe['lastCheck'] is not None and now-float(probe['lastCheck'])<3.0:
+        if (probe['result']=='PROBE_CONFIRMED' and probe['lastCheck'] is not None
+                and now-float(probe['lastCheck'])<3.0):
             return
         targetBlock=None
         if self.waitBlocks is None:
