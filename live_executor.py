@@ -28,6 +28,7 @@ from campaign_config import (FLEX_KIND, FLEX_POLICY, PILOT_KIND, PILOT_POLICY,
     EARLY_KIND, EARLY_POLICY, EARLY_TRIGGER_MULTIPLES, flexSettings,
     globalWalletLock, otherLiveExecutors)
 from campaign_finance import CampaignFinance
+from campaign_v3 import validateCampaign, campaignDigest
 
 PURCHASES=20
 BUY_GBP=Decimal('0.10')
@@ -53,7 +54,13 @@ def nextInterval(lastGrowth, now):
 
 
 class ExecutionStore:
-    def __init__(self,path,sacrifice=False,probeWaitBlocks=None,oneFifty=False,twoFifty=False,twoFifty2x=False,oneTwenty2x=False,flexLamb=False,flexBuyGbp=None,flexMaxPurchases=None,flexWalletAddress=None,probeMaxBuyingBlocks=None,flexPilot=False,flexEarly=False):
+    def __init__(self,path,sacrifice=False,probeWaitBlocks=None,oneFifty=False,twoFifty=False,twoFifty2x=False,oneTwenty2x=False,flexLamb=False,flexBuyGbp=None,flexMaxPurchases=None,flexWalletAddress=None,probeMaxBuyingBlocks=None,flexPilot=False,flexEarly=False,configuredCampaign=None):
+        self.configuredCampaign=validateCampaign(configuredCampaign) if configuredCampaign is not None else None
+        if self.configuredCampaign is not None:
+            rules=self.configuredCampaign["sacrifice"]
+            sacrifice=rules["enabled"]
+            probeWaitBlocks=rules["wait"]["value"] if rules["wait"]["unit"]=="blocks" else None
+            probeMaxBuyingBlocks=rules["activityMaxBuyingBlocks"]
         if flexEarly and (flexPilot or flexLamb):
             raise ValueError('CONFLICTING_FLEX_CAMPAIGN_MODES')
         if (oneFifty and (twoFifty or twoFifty2x)) or (twoFifty and twoFifty2x):
@@ -81,10 +88,10 @@ class ExecutionStore:
             raise ValueError('TWO_50P_2X_REQUIRES_500_BLOCK_LAMB')
         if oneTwenty2x and (not sacrifice or probeWaitBlocks!=500):
             raise ValueError('ONE_20P_2X_REQUIRES_500_BLOCK_LAMB')
-        if probeWaitBlocks is not None and (
+        if self.configuredCampaign is None and probeWaitBlocks is not None and (
                 not sacrifice or type(probeWaitBlocks) is not int or probeWaitBlocks!=500):
             raise ValueError('UNSUPPORTED_PROBE_SURVIVAL_POLICY')
-        if probeMaxBuyingBlocks is not None and (
+        if self.configuredCampaign is None and probeMaxBuyingBlocks is not None and (
                 type(probeMaxBuyingBlocks) is not int or probeMaxBuyingBlocks!=MAX_BUYING_BLOCKS
                 or probeWaitBlocks!=500 or not sacrifice):
             raise ValueError('UNSUPPORTED_PROBE_ACTIVITY_POLICY')
@@ -114,10 +121,33 @@ class ExecutionStore:
                            'TWO_50P_2X_LAMB' if self.twoFifty2x else
                            'TWO_50P_LAMB' if self.twoFifty else
                            'ONE_50P_LAMB' if self.oneFifty else 'FIVE_LAMB')
+        self.probeGbp=(Decimal(self.configuredCampaign["sacrifice"]["stakeGbp"])
+                       if self.configuredCampaign else Decimal("0.01"))
+        self.probeWaitSeconds=(self.configuredCampaign["sacrifice"]["wait"]["value"]
+                               if self.configuredCampaign and
+                                  self.configuredCampaign["sacrifice"]["wait"]["unit"]=="seconds"
+                               else 10.0)
+        self.entryDeadlineSeconds=(self.configuredCampaign["execution"]["entryDeadlineSeconds"]
+                                   if self.configuredCampaign else BUY_LAG_LIMIT)
+        self.sacrificeDeadlineSeconds=(self.configuredCampaign["execution"]["sacrificeDeadlineSeconds"]
+                                       if self.configuredCampaign else 3.0)
+        if self.configuredCampaign:
+            self.buyGbp=Decimal(self.configuredCampaign["main"]["stakeGbp"])
+            self.purchaseLimit=self.configuredCampaign["main"]["maxPurchases"]
+            self.campaignKind="CONFIGURED_V3"
         path=Path(path)
+        if self.configuredCampaign is not None and path.is_file() and path.stat().st_size:
+            try:
+                with sqlite3.connect(f'file:{path.resolve()}?mode=ro',uri=True,timeout=2) as previous:
+                    recorded=dict(previous.execute('SELECT key,value FROM meta'))
+            except sqlite3.Error as exc:
+                raise RuntimeError('CONFIGURED_V3_DB_UNREADABLE') from exc
+            if (recorded.get("campaignVersion")!="3" or
+                    recorded.get("campaignIdentity")!=campaignDigest(self.configuredCampaign)):
+                raise RuntimeError("CONFIGURED_V3_CAMPAIGN_IDENTITY_MISMATCH")
         # Validate an existing file in READ-ONLY mode BEFORE any schema writes.
         # Old campaign databases must remain byte-for-byte untouched.
-        if self.sacrifice and path.is_file() and path.stat().st_size:
+        if self.sacrifice and self.configuredCampaign is None and path.is_file() and path.stat().st_size:
             try:
                 with sqlite3.connect(f'file:{path.resolve()}?mode=ro',uri=True,timeout=2) as previous:
                     recorded=dict(previous.execute('SELECT key,value FROM meta'))
@@ -228,16 +258,66 @@ class ExecutionStore:
                 expected['probeMaxBuyingBlocks']=str(MAX_BUYING_BLOCKS)
             if self.flexLamb:
                 expected.update(walletPublicAddress=self.flexWalletAddress,flexConfigVersion=self.flexConfigVersion)
-            if any(self.get(k,'')!=v for k,v in expected.items()):
+            if self.configuredCampaign is None and any(self.get(k,'')!=v for k,v in expected.items()):
                 raise RuntimeError('Sacrificial campaign settings mismatch; no existing DB migration')
         else:
             if self.get('campaignVersion','')=='':
                 self.set('campaignVersion','1')
                 self.set('maxPurchases',str(PURCHASES))
                 self.set('buyGbp',str(BUY_GBP))
-            if self.get('maxPurchases')!=str(PURCHASES) or self.get('buyGbp')!=str(BUY_GBP):
+            if self.configuredCampaign is None and (self.get('maxPurchases')!=str(PURCHASES) or self.get('buyGbp')!=str(BUY_GBP)):
                 raise RuntimeError('Campaign settings mismatch')
+        if self.configuredCampaign is not None:
+            self.db.execute("""CREATE TABLE IF NOT EXISTS exit_slices(
+                selectionId TEXT NOT NULL,stage INTEGER NOT NULL,
+                multiple TEXT NOT NULL,percent TEXT NOT NULL,
+                triggered INTEGER NOT NULL DEFAULT 0,
+                sold INTEGER NOT NULL DEFAULT 0,
+                soldQty TEXT NOT NULL DEFAULT '0',
+                PRIMARY KEY(selectionId,stage))""")
+            fields={
+                "campaignVersion": "3",
+                "campaignKind": "CONFIGURED_V3",
+                "campaignIdentity": campaignDigest(self.configuredCampaign),
+                "buyGbp": str(self.buyGbp),
+                "maxPurchases": str(self.purchaseLimit),
+                "probeGbp": str(self.probeGbp),
+                "walletPublicAddress": self.configuredCampaign["walletPublicAddress"],
+                "intakeState": "OPEN",
+            }
+            if self.get("campaignVersion","") in ("1","2"):
+                # A new database may have been seeded by the legacy schema code.
+                # Preflight rejected existing old ledgers BEFORE any writes.
+                for key,value in fields.items():
+                    self.set(key,value)
+            elif any(self.get(k,"")!=v for k,v in fields.items() if k!="intakeState"):
+                raise RuntimeError("CONFIGURED_V3_METADATA_MISMATCH")
         installManualSchema(self)
+
+    def seedExitStages(self, selectionId):
+        if self.configuredCampaign is None:
+            return
+        for stage,item in enumerate(self.configuredCampaign["exits"],1):
+            self.db.execute("""INSERT OR IGNORE INTO exit_slices
+                (selectionId,stage,multiple,percent) VALUES(?,?,?,?)""",
+                (selectionId,stage,item["multiple"],item["percent"]))
+
+    def stageRow(self, selectionId, stage):
+        return self.db.execute("SELECT * FROM exit_slices WHERE selectionId=? AND stage=?",
+                               (selectionId,stage)).fetchone()
+
+    def canSpend(self,kind):
+        """Nominal campaign exposure limit, including outstanding signed intents."""
+        if self.configuredCampaign is None:
+            return True
+        counts=dict(self.db.execute("""SELECT kind,COUNT(DISTINCT selectionId)
+                  FROM transactions WHERE kind IN ('PROBE_BUY','BUY') GROUP BY kind"""))
+        probes=counts.get("PROBE_BUY",0)
+        if kind=="PROBE_BUY" and probes>=self.configuredCampaign["limits"]["maxSacrifices"]:
+            return False
+        total=(self.probeGbp*probes + self.buyGbp*counts.get("BUY",0)
+               + (self.probeGbp if kind=="PROBE_BUY" else self.buyGbp))
+        return total<=Decimal(self.configuredCampaign["limits"]["maxNominalSpendGbp"])
 
     def observe(self,**values):
         self.db.execute("""INSERT INTO observations
