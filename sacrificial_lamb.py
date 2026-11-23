@@ -20,7 +20,7 @@ class LambGate:
     def __init__(self,executor,receiptReader,waitBlocks=None):
         if waitBlocks is not None and (
                 type(waitBlocks) is not int or waitBlocks < 1 or
-                (waitBlocks != 500 and executor.store.configuredCampaign is None)):
+                (waitBlocks != 500 and getattr(executor.store,'configuredCampaign',None) is None)):
             raise ValueError('UNSUPPORTED_SACRIFICIAL_BLOCK_GATE')
         self.owner=executor
         self.store=executor.store
@@ -32,14 +32,14 @@ class LambGate:
         # Unversioned historical 500-block campaigns retain their original gate.
         # Minimal offline test stores without a policy attribute exercise the
         # new collector independently.
-        filtered=((self.store.configuredCampaign is not None and
+        filtered=((getattr(self.store,'configuredCampaign',None) is not None and
                    self.store.probeMaxBuyingBlocks is not None and
                    waitBlocks is not None and waitBlocks >= 500) or
-                  (self.store.configuredCampaign is None and waitBlocks==500 and
+                  (getattr(self.store,'configuredCampaign',None) is None and waitBlocks==500 and
                    getattr(self.store,'probeMaxBuyingBlocks',7)==7))
         self.activity=(ProbeBuyingBlocks(
             self.store,self.owner.rpc,maxBuyingBlocks=self.store.probeMaxBuyingBlocks
-            if self.store.configuredCampaign else MAX_BUYING_BLOCKS) if filtered else None)
+            if getattr(self.store,'configuredCampaign',None) else MAX_BUYING_BLOCKS) if filtered else None)
 
     @staticmethod
     def blockNumber(value):
@@ -178,7 +178,7 @@ class LambGate:
         if (selection['status']!='LAMB_QUEUED' or not self.store.eligible()
                 or self.revoked(selectionId)):
             return
-        if not self.store.canSpend("PROBE_BUY"):
+        if hasattr(self.store,"canSpend") and not self.store.canSpend("PROBE_BUY"):
             self.state(selectionId,"PROBE_FAILED","SACRIFICE_BUDGET_LIMIT")
             return
         if self.store.transactions(selectionId,'PROBE_BUY'):
@@ -188,12 +188,12 @@ class LambGate:
         if reason:
             self.state(selectionId,'PROBE_FAILED',reason)
             return
-        if time.time()-selection['decisionAt']>self.store.sacrificeDeadlineSeconds:
+        if time.time()-selection['decisionAt']>getattr(self.store,'sacrificeDeadlineSeconds',PROBE_ENTRY_SECONDS):
             self.state(selectionId,'PROBE_FAILED','MISSED_1P_DEADLINE')
             return
         try:
             rate=await self.owner.fx.get()
-            amountWei=int((self.store.probeGbp/rate*10**18).to_integral_value(rounding=ROUND_DOWN))
+            amountWei=int((getattr(self.store,'probeGbp',PROBE_GBP)/rate*10**18).to_integral_value(rounding=ROUND_DOWN))
             if amountWei<=0:raise RuntimeError('ZERO_PROBE_VALUE')
             quote=(await self.owner.swaps.verifiedBuyCandidates(token,amountWei))[0]
             if time.time()-selection['decisionAt']>PROBE_ENTRY_SECONDS:
@@ -276,7 +276,7 @@ class LambGate:
         self.store.observe(token=selection['token'],phase='PROBE_ENTRY',at=now,
             block=str(receipt.get('blockNumber')),venue_id=None,
             status='CONFIRMED_FILL',quantity=str(qty),
-            out_wei=str(transaction['inputAmount']),gbp=str(self.store.probeGbp),
+            out_wei=str(transaction['inputAmount']),gbp=str(getattr(self.store,'probeGbp',PROBE_GBP)),
             multiple=None,basis='RECEIPT_TOKEN_TRANSFER',reason=None)
         print('LAMB CONFIRMED 1P',selection['token'],qty,flush=True)
 
@@ -294,7 +294,7 @@ class LambGate:
             return
         targetBlock=None
         if self.waitBlocks is None:
-            if now<float(probe['confirmedAt'])+self.store.probeWaitSeconds:
+            if now<float(probe['confirmedAt'])+getattr(self.store,'probeWaitSeconds',WAIT_SECONDS):
                 return
         else:
             # Missing bins are not zero buys; wait for the progressive collector
