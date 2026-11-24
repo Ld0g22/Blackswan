@@ -79,7 +79,7 @@ class NewAlchemyCredentialTests(unittest.TestCase):
         p=subprocess.run([sys.executable,str(script),"run","--duration-seconds","30"],
                          text=True,capture_output=True,timeout=10)
         self.assertNotEqual(p.returncode,0)
-        self.assertIn("explicit --env",p.stderr.lower())
+        self.assertIn("supply --env",p.stderr.lower())
         self.assertNotIn("blackswanRH_guarded",p.stderr)
 
 
