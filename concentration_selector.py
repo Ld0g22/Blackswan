@@ -34,7 +34,8 @@ SILENT_POOL_YIELD_SECONDS = 2
 MAX_RPC_CONCURRENCY = 2
 MAX_SCAN_BLOCKS = 512
 MIN_SCAN_BLOCKS = 10
-SILENT_SCAN_SECONDS = 5.0
+DEFAULT_SCAN_BLOCKS = 10
+RANGE_FILL_SECONDS = 1.0
 ACTIVE_RETRY_SECONDS = 0.75
 TRADE_HINT_SECONDS = 10.0
 MAX_ACTIONABLE_DECISION_LAG_SECONDS = 15
@@ -91,12 +92,17 @@ class ConcentrationSelector(Selector):
 
     def __init__(self, detectorPath, dbPath, httpUrl, wsUrl, *,
                  windowSeconds=DEFAULT_WINDOW, thresholdBps=DEFAULT_SHARE_BPS,
-                 firstTradeTimeoutSeconds=DEFAULT_FIRST_TRADE_TIMEOUT):
+                 firstTradeTimeoutSeconds=DEFAULT_FIRST_TRADE_TIMEOUT,
+                 maxScanBlocks=DEFAULT_SCAN_BLOCKS):
         if (type(windowSeconds) is not int or windowSeconds != DEFAULT_WINDOW
                 or type(thresholdBps) is not int or thresholdBps != DEFAULT_SHARE_BPS
                 or type(firstTradeTimeoutSeconds) is not int
                 or not 30 <= firstTradeTimeoutSeconds <= 3600):
             raise ValueError("UNSUPPORTED_CONCENTRATION_POLICY")
+        if type(maxScanBlocks) is not int or not MIN_SCAN_BLOCKS <= maxScanBlocks <= MAX_SCAN_BLOCKS:
+            raise ValueError("INVALID_CONCENTRATION_SCAN_BLOCK_LIMIT")
+        self.scanLimit=maxScanBlocks
+        self.partialRangeSince=None
         self.windowSeconds = windowSeconds
         self.thresholdBps = thresholdBps
         self.firstTradeTimeoutSeconds = firstTradeTimeoutSeconds
@@ -142,9 +148,9 @@ class ConcentrationSelector(Selector):
         self.rpcFailureStreak = 0
         self.lastRpcThrottleAt = 0.0
         self.rpcErrors = Counter()
-        self.scanRangeByKey = {}
         self.lastAudit = 0.0
         self.auditTask = None
+        self.coverageTask = None
         self.stats = Counter()
         self.validatedCheckpoints = set()
         self.headLock = asyncio.Lock()
@@ -258,21 +264,6 @@ class ConcentrationSelector(Selector):
             "SELECT blockNumber,blockTimestamp FROM concentration_swaps WHERE eventKey=? "
             "ORDER BY blockNumber,logIndex LIMIT 1",(key,)).fetchone()
 
-    def nextScanDelay(self,cand):
-        first=self.firstTrade(cand.eventKey)
-        if first is not None:
-            cutoff=first["blockTimestamp"]+self.windowSeconds
-            # Once the canonical anchor is known, no incremental RPC is
-            # required until the complete observation window can be sealed.
-            return max(ACTIVE_RETRY_SECONDS,cutoff-self.wallTime())
-        return ACTIVE_RETRY_SECONDS if self.hasTradeHint(cand) else SILENT_SCAN_SECONDS
-
-    async def waitForWake(self,cand,delay):
-        try:
-            await asyncio.wait_for(cand.wake.wait(),timeout=max(.05,delay))
-        except asyncio.TimeoutError:
-            pass
-
     def acceptLog(self,cand,raw,receivedAt,origin):
         """Websocket is a fast hint. Canonical HTTP backfill is decision truth."""
         if not isinstance(raw,dict):
@@ -358,13 +349,17 @@ class ConcentrationSelector(Selector):
             raise RuntimeError("MISSING_CANONICAL_BLOCK_HEADER")
         return result["hash"].lower(),int(result["timestamp"],16)
 
-    async def validateChunks(self,key):
+    async def validateChunks(self,key,headers=None):
         """A changed boundary hash implies an earlier batch was from a fork."""
         chunks=self.store.db.execute(
             "SELECT startBlock,endBlock,endHash FROM concentration_chunks "
             "WHERE eventKey=? ORDER BY startBlock",(key,)).fetchall()
+        headers={} if headers is None else headers
         for chunk in chunks:
-            canonical,_=await self._header(chunk["endBlock"])
+            number=chunk["endBlock"]
+            if number not in headers:
+                headers[number]=await self._header(number)
+            canonical,_=headers[number]
             if canonical != chunk["endHash"]:
                 self.store.db.execute("BEGIN IMMEDIATE")
                 try:
@@ -410,154 +405,301 @@ class ConcentrationSelector(Selector):
                   "reason",payload.get("reason"),flush=True)
 
     async def scanOnce(self,key):
-        """Read a bounded canonical range; adapt if the provider rejects its size."""
+        """Single-candidate compatibility entry point for offline and unit tests."""
+        return await self.scanGroup([key])
+
+    async def prepareCoverage(self,key,headers):
         launch=self.store.db.execute(
             "SELECT * FROM launches WHERE eventKey=?",(key,)).fetchone()
         if launch is None or launch["state"]!="PENDING":
-            return
+            return None
         meta=json.loads(launch["data"])
         event,venue=meta["event"],meta["venue"]
         if venue["source"]!="uniswapV4":
             self.finish(key,"UNKNOWN",dict(reason="NOT_V4",coverageComplete=False))
-            return
+            return None
         start=int(event["blockNumber"])
+        self.store.db.execute(
+            "INSERT OR IGNORE INTO concentration_progress(eventKey,nextBlock) VALUES(?,?)",
+            (key,start))
         state=self.store.db.execute(
             "SELECT * FROM concentration_progress WHERE eventKey=?",(key,)).fetchone()
-        if state is None:
-            self.store.db.execute(
-                "INSERT OR IGNORE INTO concentration_progress(eventKey,nextBlock) VALUES(?,?)",
-                (key,start))
-            state=self.store.db.execute(
-                "SELECT * FROM concentration_progress WHERE eventKey=?",(key,)).fetchone()
         if state["launchTimestamp"] is None:
-            _,launchAt=await self._header(start)
+            if start not in headers:headers[start]=await self._header(start)
+            _,launchAt=headers[start]
             self.store.db.execute(
                 "UPDATE concentration_progress SET launchTimestamp=? WHERE eventKey=?",
                 (launchAt,key))
         else:
             launchAt=state["launchTimestamp"]
-        # A restarted candidate never discards the original first-trade
-        # observation or treats an unverified batch as complete.
+        # Restart recovery must revalidate every old checkpoint before it
+        # can benefit from the incremental, linked canonical proof.
         if key not in self.validatedCheckpoints:
-            if not await self.validateChunks(key):
-                return
+            if not await self.validateChunks(key,headers):
+                return None
             self.validatedCheckpoints.add(key)
         state=self.store.db.execute(
             "SELECT * FROM concentration_progress WHERE eventKey=?",(key,)).fetchone()
-        head=await self.head()
-        nextBlock=state["nextBlock"]
-        if head>=nextBlock:
-            rangeSize=self.scanRangeByKey.get(key,MAX_SCAN_BLOCKS)
-            while True:
-                last=min(head,nextBlock+rangeSize-1)
-                filt={"address":V4_MANAGER,"topics":[V4_SWAP,venue["id"]],
-                      "fromBlock":hex(nextBlock),"toBlock":hex(last)}
-                # Fence the getLogs read with canonical boundary hashes,
-                # including EMPTY ranges: a fork cannot silently erase swaps.
-                endHash,endTimestamp=await self._header(last)
-                try:
-                    logs=await self.rpc("eth_getLogs",[filt],timeout=4)
-                except RuntimeError as exc:
-                    if (str(exc) in ("RPC_HTTP_400","RPC_HTTP_413",
-                                      "RPC_JSONRPC_-32005","RPC_JSONRPC_-32602")
-                            and last-nextBlock+1>MIN_SCAN_BLOCKS):
-                        # Reduce to a strict power-of-two bound, never retry
-                        # the same rejected range at a different nominal size.
-                        rangeSize=max(MIN_SCAN_BLOCKS,min(rangeSize//2,
-                            1 << ((last-nextBlock).bit_length()-1)))
-                        self.scanRangeByKey[key]=rangeSize
-                        self.stats["rangeReductions"]+=1
-                        continue
-                    raise
-                break
-            if not isinstance(logs,list):
-                raise RuntimeError("INVALID_RPC_LOGS_RESULT")
-            verified={last:(endHash,endTimestamp)}
-            newRows=[]
-            for raw in logs:
-                if raw.get("removed"):
-                    raise RuntimeError("RPC_LOG_MARKED_REMOVED")
-                decoded=decodeLog(raw,venue)
-                if decoded["kind"]!="trade":
-                    raise RuntimeError("NON_SWAP_IN_SWAP_BACKFILL")
-                number=decoded["blockNumber"]
-                if not nextBlock<=number<=last:
-                    raise RuntimeError("LOG_OUTSIDE_REQUESTED_RANGE")
-                if number not in verified:
-                    verified[number]=await self._header(number)
-                blockHash,blockTimestamp=verified[number]
-                if (decoded["blockHash"]!=blockHash
-                        or blockTimestamp>endTimestamp):
-                    raise RuntimeError("NONCANONICAL_SWAP_LOG")
-                newRows.append((key,number,blockHash,decoded["transactionHash"],
-                                decoded["logIndex"],blockTimestamp,
-                                str(decoded["buyBaseAmount"]),
-                                json.dumps(raw,sort_keys=True)))
-            finalHash,finalTimestamp=await self._header(last)
-            if (finalHash,finalTimestamp)!=(endHash,endTimestamp):
-                raise RuntimeError("RANGE_REORG_DURING_GETLOGS")
-            self.store.db.execute("BEGIN IMMEDIATE")
-            try:
-                for entry in newRows:
-                    self.store.db.execute("""INSERT OR REPLACE INTO concentration_swaps
-                        (eventKey,blockNumber,blockHash,transactionHash,logIndex,
-                        blockTimestamp,buyBaseRaw,raw) VALUES(?,?,?,?,?,?,?,?)""",entry)
-                self.store.db.execute("""INSERT OR REPLACE INTO concentration_chunks(
-                    eventKey,startBlock,endBlock,endHash,endTimestamp)
-                    VALUES(?,?,?,?,?)""",(key,nextBlock,last,endHash,endTimestamp))
-                self.store.db.execute(
-                    "UPDATE concentration_progress SET nextBlock=?,lastError=NULL WHERE eventKey=?",
-                    (last+1,key))
-                self.store.db.execute("COMMIT")
-            except BaseException:
-                if self.store.db.in_transaction:self.store.db.execute("ROLLBACK")
-                raise
-
-        first=self.firstTrade(key)
-        lastChunk=self.store.db.execute(
+        previous=self.store.db.execute(
             "SELECT endBlock,endHash,endTimestamp FROM concentration_chunks WHERE eventKey=? "
             "ORDER BY endBlock DESC LIMIT 1",(key,)).fetchone()
-        if lastChunk is None:
-            return
+        nextBlock=state["nextBlock"]
+        if ((previous is None and nextBlock!=start) or
+                (previous is not None and previous["endBlock"]+1!=nextBlock)):
+            raise RuntimeError("COVERAGE_CHECKPOINT_GAP")
+        return dict(key=key,venue=venue,launchAt=launchAt,nextBlock=nextBlock,previous=previous)
+
+    async def sealCoverage(self,item,chunk,fresh=False):
+        """Seal only a fully covered canonical window, never a WS estimate."""
+        key=item["key"]
+        if chunk is None:return
+        first=self.firstTrade(key)
+        launchAt=item["launchAt"]
         if first is None:
-            if lastChunk["endTimestamp"]>=launchAt+self.firstTradeTimeoutSeconds:
-                if await self.validateChunks(key):
-                    self.finish(key,"UNKNOWN",dict(
-                        reason="NO_FIRST_TRADE_WITHIN_OBSERVATION_BUDGET",
-                        coverageComplete=True,firstTradeAt=None,evidenceErrors=[]))
+            if chunk["endTimestamp"]<launchAt+self.firstTradeTimeoutSeconds:return
+            reason="NO_FIRST_TRADE_WITHIN_OBSERVATION_BUDGET"
+        elif first["blockTimestamp"]>launchAt+self.firstTradeTimeoutSeconds:
+            reason="FIRST_TRADE_AFTER_OBSERVATION_BUDGET"
+        else:
+            cutoff=first["blockTimestamp"]+self.windowSeconds
+            if chunk["endTimestamp"]<cutoff:return
+            reason=None
+        # A newly committed range already fenced its end hash and checked
+        # the preceding anchor. Its ancestry commits all verified ranges.
+        # On restart or an idle seal, recheck the latest anchor explicitly.
+        if not fresh:
+            current,_=await self._header(chunk["endBlock"])
+            if current!=chunk["endHash"]:
+                await self.validateChunks(key)
+                return
+        if reason:
+            self.finish(key,"UNKNOWN",dict(reason=reason,coverageComplete=True,
+                firstTradeAt=first["blockTimestamp"] if first else None,evidenceErrors=[]))
             return
-        if first["blockTimestamp"]>launchAt+self.firstTradeTimeoutSeconds:
-            if await self.validateChunks(key):
-                self.finish(key,"UNKNOWN",dict(
-                    reason="FIRST_TRADE_AFTER_OBSERVATION_BUDGET",
-                    coverageComplete=True,firstTradeAt=first["blockTimestamp"],
-                    evidenceErrors=[]))
-            return
-        cutoff=first["blockTimestamp"]+self.windowSeconds
-        if lastChunk["endTimestamp"]<cutoff:
-            # A delayed or stalled provider must not cause a false PASS.
-            # The normal scheduler retries and retains the original anchor.
-            return
-        if not await self.validateChunks(key):
-            return
-        # Final canonical block hash is a chain commitment to all prior
-        # blocks. Verify every saved batch boundary against the present chain.
         rows=self.store.db.execute(
             "SELECT transactionHash,buyBaseRaw,blockTimestamp FROM concentration_swaps "
             "WHERE eventKey=? ORDER BY blockNumber,logIndex",(key,)).fetchall()
         result=self._decision(key,first,rows)
         self.store.db.execute("""INSERT OR REPLACE INTO concentration_audits(
             eventKey,lastBlock,lastHash,lastChecked) VALUES(?,?,?,?)""",
-            (key,lastChunk["endBlock"],lastChunk["endHash"],time.time()))
+            (key,chunk["endBlock"],chunk["endHash"],time.time()))
         status=result.pop("status")
         latency=self.wallTime()-cutoff
         result["decisionLagSeconds"]=round(max(0,latency),3)
         if status=="PASS" and latency>MAX_ACTIONABLE_DECISION_LAG_SECONDS:
-            # Historical backfill is evidence, not permission to enter late.
             result["hypotheticalStatus"]="PASS"
             result["reason"]="CONCENTRATION_WINDOW_TOO_OLD"
             status="UNKNOWN"
         self.finish(key,status,result)
+
+    async def scanGroup(self,keys,head=None):
+        """One canonical eth_getLogs range for every overlapping pool cursor.
+
+        All candidates retain independent durable cursors, swap evidence and
+        decisions. The filter shares only network coverage, never volumes.
+        """
+        prepHeaders={}
+        items=[]
+        for key in dict.fromkeys(keys):
+            item=await self.prepareCoverage(key,prepHeaders)
+            if item is not None:items.append(item)
+        if not items:return False
+        head=await self.head() if head is None else head
+        ready=[item for item in items if item["nextBlock"]<=head]
+        if not ready:
+            for item in items:
+                await self.sealCoverage(item,item["previous"])
+            return False
+        start=min(item["nextBlock"] for item in ready)
+        rangeSize=self.scanLimit
+        while True:
+            last=min(head,start+rangeSize-1)
+            group=[item for item in ready if item["nextBlock"]<=last]
+            byPool=defaultdict(list)
+            for item in group:byPool[item["venue"]["id"].lower()].append(item)
+            pools=sorted(byPool)
+            # A single pool remains a standard scalar topic; multiple pools
+            # use the standard JSON-RPC OR filter at the PoolId position.
+            filt={"address":V4_MANAGER,"topics":[V4_SWAP,pools[0] if len(pools)==1 else pools],
+                  "fromBlock":hex(start),"toBlock":hex(last)}
+            endHash,endTimestamp=await self._header(last)
+            try:
+                logs=await self.rpc("eth_getLogs",[filt],timeout=4)
+            except RuntimeError as exc:
+                if (str(exc) in ("RPC_HTTP_400","RPC_HTTP_413",
+                                  "RPC_JSONRPC_-32005","RPC_JSONRPC_-32602")
+                        and last-start+1>MIN_SCAN_BLOCKS):
+                    rangeSize=max(MIN_SCAN_BLOCKS,min(rangeSize//2,
+                        1 << ((last-start).bit_length()-1)))
+                    # Learn the provider bound once, not once per pool.
+                    self.scanLimit=rangeSize
+                    self.stats["rangeReductions"]+=1
+                    continue
+                raise
+            break
+        if not isinstance(logs,list):
+            raise RuntimeError("INVALID_RPC_LOGS_RESULT")
+        verified={last:(endHash,endTimestamp)}
+        newRows=defaultdict(list)
+        for raw in logs:
+            if raw.get("removed"):
+                raise RuntimeError("RPC_LOG_MARKED_REMOVED")
+            topics=raw.get("topics") or []
+            if len(topics)<2 or not isinstance(topics[1],str) or topics[1].lower() not in byPool:
+                raise RuntimeError("LOG_OUTSIDE_REQUESTED_POOLS")
+            number=int(raw["blockNumber"],16)
+            if not start<=number<=last:
+                raise RuntimeError("LOG_OUTSIDE_REQUESTED_RANGE")
+            if number not in verified:verified[number]=await self._header(number)
+            blockHash,blockTimestamp=verified[number]
+            for item in byPool[topics[1].lower()]:
+                if number<item["nextBlock"]:continue
+                decoded=decodeLog(raw,item["venue"])
+                if (decoded["kind"]!="trade" or decoded["blockHash"]!=blockHash
+                        or blockTimestamp>endTimestamp):
+                    raise RuntimeError("NONCANONICAL_SWAP_LOG")
+                newRows[item["key"]].append((item["key"],number,blockHash,
+                    decoded["transactionHash"],decoded["logIndex"],blockTimestamp,
+                    str(decoded["buyBaseAmount"]),json.dumps(raw,sort_keys=True)))
+        # Check each distinct preceding canonical boundary ONCE. If its
+        # hash changed, rewind that candidate rather than merging forks.
+        # The final range-end fence follows these checks, so each new
+        # verified anchor extends the already validated canonical ancestry.
+        previousHeaders={}
+        valid=[]
+        invalid=[]
+        for item in group:
+            previous=item["previous"]
+            if previous is not None:
+                number=previous["endBlock"]
+                if number not in previousHeaders:
+                    previousHeaders[number]=await self._header(number)
+                if previousHeaders[number][0]!=previous["endHash"]:
+                    invalid.append(item)
+                    continue
+            valid.append(item)
+        finalHash,finalTimestamp=await self._header(last)
+        if (finalHash,finalTimestamp)!=(endHash,endTimestamp):
+            raise RuntimeError("RANGE_REORG_DURING_GETLOGS")
+        for item in invalid:
+            await self.validateChunks(item["key"])
+        # Rewind validation can perform RPCs; don't use a stale end fence.
+        if invalid and valid:
+            finalHash,finalTimestamp=await self._header(last)
+            if (finalHash,finalTimestamp)!=(endHash,endTimestamp):
+                raise RuntimeError("RANGE_REORG_DURING_GETLOGS")
+        committed=[]
+        self.store.db.execute("BEGIN IMMEDIATE")
+        try:
+            for item in valid:
+                key=item["key"]
+                state=self.store.db.execute(
+                    "SELECT state FROM launches WHERE eventKey=?",(key,)).fetchone()
+                if state is None or state["state"]!="PENDING":continue
+                for entry in newRows[key]:
+                    self.store.db.execute("""INSERT OR REPLACE INTO concentration_swaps
+                        (eventKey,blockNumber,blockHash,transactionHash,logIndex,
+                        blockTimestamp,buyBaseRaw,raw) VALUES(?,?,?,?,?,?,?,?)""",entry)
+                self.store.db.execute("""INSERT OR REPLACE INTO concentration_chunks(
+                    eventKey,startBlock,endBlock,endHash,endTimestamp)
+                    VALUES(?,?,?,?,?)""",(key,item["nextBlock"],last,endHash,endTimestamp))
+                self.store.db.execute(
+                    "UPDATE concentration_progress SET nextBlock=?,lastError=NULL WHERE eventKey=?",
+                    (last+1,key))
+                committed.append(item)
+            self.store.db.execute("COMMIT")
+        except BaseException:
+            if self.store.db.in_transaction:self.store.db.execute("ROLLBACK")
+            raise
+        self.stats["sharedRanges"]+=1
+        self.stats["candidateRanges"]+=len(committed)
+        chunk=dict(endBlock=last,endHash=endHash,endTimestamp=endTimestamp)
+        for item in committed:
+            await self.sealCoverage(item,chunk,fresh=True)
+        return bool(committed)
+
+    def coverageCandidates(self):
+        """Choose one overlapping range, prioritizing a real trading window."""
+        rows=self.store.db.execute("""
+            SELECT l.eventKey,l.data,l.detectedAt,p.nextBlock,
+                (SELECT MIN(blockTimestamp) FROM concentration_swaps s
+                 WHERE s.eventKey=l.eventKey) AS firstTradeAt
+            FROM launches l LEFT JOIN concentration_progress p
+                ON p.eventKey=l.eventKey
+            WHERE l.state='PENDING' ORDER BY l.detectedAt,l.eventKey
+        """).fetchall()
+        result=[]
+        for row in rows:
+            item=dict(row)
+            if item["nextBlock"] is None:
+                item["nextBlock"]=int(json.loads(item["data"])["event"]["blockNumber"])
+            result.append(item)
+        return result
+
+    def selectCoverageRange(self,rows,head):
+        ready=[row for row in rows if row["nextBlock"]<=head]
+        if not ready:return []
+        active=[row for row in ready if row["firstTradeAt"] is not None or
+                self.hasTradeHint(self.candidates.get(row["eventKey"]))]
+        if active:
+            chosen=min(active,key=lambda row:(
+                row["firstTradeAt"] if row["firstTradeAt"] is not None else self.wallTime(),
+                row["nextBlock"]))
+            anchor=chosen["nextBlock"]
+            start=min(row["nextBlock"] for row in ready
+                      if anchor-self.scanLimit+1<=row["nextBlock"]<=anchor)
+        else:
+            start=min(row["nextBlock"] for row in ready)
+        end=min(head,start+self.scanLimit-1)
+        group=[row for row in ready if start<=row["nextBlock"]<=end]
+        # Fill the provider-sized range near the live head rather than
+        # sending a separate getLogs request for every single new block.
+        now=time.monotonic()
+        urgent=any(row["firstTradeAt"] is not None and
+                   self.wallTime()>=row["firstTradeAt"]+self.windowSeconds for row in group)
+        if end-start+1<self.scanLimit and not urgent:
+            if self.partialRangeSince is None:self.partialRangeSince=now
+            if now-self.partialRangeSince<RANGE_FILL_SECONDS:return []
+        self.partialRangeSince=None
+        return group
+
+    async def coverageCycle(self):
+        rows=self.coverageCandidates()
+        if not rows:return False
+        if time.monotonic()<self.rpcPauseUntil:return False
+        head=await self.head()
+        group=self.selectCoverageRange(rows,head)
+        if not group:return False
+        keys=[row["eventKey"] for row in group]
+        try:
+            async with self.httpGate:
+                return await self.scanGroup(keys,head=head)
+        except (RuntimeError,ValueError,KeyError,IndexError,TypeError,
+                aiohttp.ClientError,asyncio.TimeoutError,sqlite3.Error) as exc:
+            reason=(type(exc).__name__+":"+str(exc)[:90]
+                    if isinstance(exc,RuntimeError) else type(exc).__name__)
+            self.stats["retries"]+=1
+            if str(exc)!="RPC_BACKOFF_ACTIVE":
+                for key in keys:
+                    self.store.db.execute(
+                        "UPDATE concentration_progress SET lastError=? WHERE eventKey=?",
+                        (reason,key))
+            await asyncio.sleep(ACTIVE_RETRY_SECONDS)
+            return False
+
+    async def coverageLoop(self):
+        """One shared canonical scanner, regardless of candidate count."""
+        while not self.stopping.is_set():
+            self.expireUnstarted(time.time())
+            try:
+                progressed=await self.coverageCycle()
+            except (RuntimeError,ValueError,KeyError,IndexError,TypeError,
+                    aiohttp.ClientError,asyncio.TimeoutError,sqlite3.Error):
+                self.stats["coverageCycleErrors"]+=1
+                await asyncio.sleep(ACTIVE_RETRY_SECONDS)
+                continue
+            if not progressed:
+                await asyncio.sleep(.2)
 
     async def auditFinal(self):
         """Conservative post-PASS canonicality monitor, never a buy instruction."""
@@ -619,87 +761,33 @@ class ConcentrationSelector(Selector):
             "SELECT eventKey FROM launches WHERE state='PENDING' AND detectedAt<?",
             (cutoff,)).fetchall()
         for row in rows:
-            if row["eventKey"] not in self.candidates:
-                self.coverageTimeout(row["eventKey"])
+            self.coverageTimeout(row["eventKey"])
 
     async def observe(self,cand):
-        """Canonical scans only when useful, with priority for active trading."""
-        if not hasattr(cand,"wake"):
-            cand.wake=asyncio.Event()
+        """WebSocket hint subscription only. Shared scanner owns all RPC coverage."""
+        if not hasattr(cand,"wake"):cand.wake=asyncio.Event()
         subscribed=self.spawn(self.subscribe(cand))
-        lastSubscriptionAttempt=time.monotonic()
-        await asyncio.sleep(0)
+        lastAttempt=time.monotonic()
         try:
             while not self.stopping.is_set():
-                cand.wake.clear()
-                launch=self.store.db.execute(
-                    "SELECT state,detectedAt FROM launches WHERE eventKey=?",
-                    (cand.eventKey,)).fetchone()
-                if launch is None or launch["state"]!="PENDING":
-                    return
-                if time.time()-float(launch["detectedAt"]) > (
-                        self.firstTradeTimeoutSeconds+self.windowSeconds+MAX_SEAL_DELAY_SECONDS):
-                    self.coverageTimeout(cand.eventKey)
-                    return
-                if cand.subId is None and subscribed.done() and time.monotonic()-lastSubscriptionAttempt>3:
+                row=self.store.db.execute(
+                    "SELECT state FROM launches WHERE eventKey=?",(cand.eventKey,)).fetchone()
+                if row is None or row["state"]!="PENDING":return
+                cand.observedFirstTrade=self.firstTrade(cand.eventKey) is not None
+                if cand.subId is None and subscribed.done() and time.monotonic()-lastAttempt>3:
                     subscribed=self.spawn(self.subscribe(cand))
-                    lastSubscriptionAttempt=time.monotonic()
-                first=self.firstTrade(cand.eventKey)
-                cand.observedFirstTrade=first is not None
-                active=cand.observedFirstTrade or self.hasTradeHint(cand)
-                pause=self.rpcPauseUntil-time.monotonic()
-                if pause>0:
-                    # Do not wake on websocket traffic during provider backoff.
-                    await asyncio.sleep(min(pause,2))
-                    continue
-                if not active and self.silentGate.locked():
-                    # Do not queue a silent task behind many silent pools;
-                    # a new WS hint can immediately promote it to active.
-                    await self.waitForWake(cand,.25)
-                    continue
-                try:
-                    if active:
-                        async with self.httpGate:
-                            await self.scanOnce(cand.eventKey)
-                    else:
-                        async with self.silentGate:
-                            async with self.httpGate:
-                                await self.scanOnce(cand.eventKey)
-                    state=self.store.db.execute(
-                        "SELECT state FROM launches WHERE eventKey=?",(cand.eventKey,)).fetchone()
-                    if state is None or state["state"]!="PENDING":
-                        return
-                    cand.observedFirstTrade=self.firstTrade(cand.eventKey) is not None
-                    delay=self.nextScanDelay(cand)
-                    if cand.observedFirstTrade:
-                        # Clear normal swap wakeups that arrived during the
-                        # initial anchor scan; canonical scan at window end.
-                        if not cand.subscriptionInterrupted:
-                            cand.wake.clear()
-                    await self.waitForWake(cand,delay)
-                except (RuntimeError,ValueError,KeyError,IndexError,TypeError,
-                        aiohttp.ClientError,asyncio.TimeoutError,sqlite3.Error) as exc:
-                    reason=(type(exc).__name__+":"+str(exc)[:90]
-                            if isinstance(exc,RuntimeError) else type(exc).__name__)
-                    self.stats["retries"]+=1
-                    if str(exc)!="RPC_BACKOFF_ACTIVE":
-                        self.store.db.execute(
-                            "UPDATE concentration_progress SET lastError=? WHERE eventKey=?",
-                            (reason,cand.eventKey))
-                    await asyncio.sleep(max(ACTIVE_RETRY_SECONDS,
-                        min(2,self.rpcPauseUntil-time.monotonic())))
+                    lastAttempt=time.monotonic()
+                await asyncio.sleep(.5)
         finally:
-            if not subscribed.done():
-                subscribed.cancel()
+            if not subscribed.done():subscribed.cancel()
             cand.closed=True
             await self.unsubscribe(cand)
             self.candidates.pop(cand.eventKey,None)
             self.observerTasks.pop(cand.eventKey,None)
-            self.validatedCheckpoints.discard(cand.eventKey)
-            state=self.store.db.execute(
+            row=self.store.db.execute(
                 "SELECT state FROM launches WHERE eventKey=?",(cand.eventKey,)).fetchone()
-            if state is None or state["state"]!="PENDING":
-                self.scanRangeByKey.pop(cand.eventKey,None)
+            if row is None or row["state"]!="PENDING":
+                self.validatedCheckpoints.discard(cand.eventKey)
                 self.deferUntil.pop(cand.eventKey,None)
 
     def pendingToStart(self, limit):
@@ -767,12 +855,12 @@ class ConcentrationSelector(Selector):
             # Pending decisions are resumed from the saved chain block cursor,
             # never rewritten as UNKNOWN merely because the process restarted.
             wsTask=self.spawn(self.websocket())
+            self.coverageTask=self.spawn(self.coverageLoop())
             reportAt=0.0
             heartAt=0.0
             try:
                 while not self.stopping.is_set():
                     self.pull()
-                    self.expireUnstarted(time.time())
                     now=self.rotationClock()
                     self.deferUntil={key:until for key,until in self.deferUntil.items() if until>now}
                     capacity=MAX_ACTIVE_CANDIDATES-len(self.candidates)
@@ -805,6 +893,7 @@ class ConcentrationSelector(Selector):
                         print("CONCENTRATION HEALTH",json.dumps({
                             "decisions":self.store.status(),
                             "active":len(self.candidates),
+                            "scanLimitBlocks":self.scanLimit,
                             "rpcCalls":dict(self.rpcCounts),
                             "rpcErrors":dict(self.rpcErrors),
                             "rpcBackoffSeconds":round(max(0,self.rpcPauseUntil-time.monotonic()),2),
@@ -831,6 +920,7 @@ def main():
     parser.add_argument("--window-seconds",type=int,default=30)
     parser.add_argument("--threshold-bps",type=int,default=2500)
     parser.add_argument("--first-trade-timeout-seconds",type=int,default=300)
+    parser.add_argument("--max-scan-blocks",type=int,default=DEFAULT_SCAN_BLOCKS)
     args=parser.parse_args()
     if args.command=="status":
         with sqlite3.connect(f"file:{args.db.resolve()}?mode=ro",uri=True) as db:
@@ -848,7 +938,8 @@ def main():
     http,ws=settings(args.env)
     selector=ConcentrationSelector(args.detector_db,args.db,http,ws,
         windowSeconds=args.window_seconds,thresholdBps=args.threshold_bps,
-        firstTradeTimeoutSeconds=args.first_trade_timeout_seconds)
+        firstTradeTimeoutSeconds=args.first_trade_timeout_seconds,
+        maxScanBlocks=args.max_scan_blocks)
     async def runner():
         loop=asyncio.get_running_loop()
         for sig in (signal.SIGINT,signal.SIGTERM):
