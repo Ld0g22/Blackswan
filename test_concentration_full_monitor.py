@@ -174,6 +174,48 @@ class MonitorSnapshotTests(unittest.TestCase):
         self.assertIn("20",output.getvalue())
         self.assertNotIn("≤0% largest tx",output.getvalue())
 
+    def test_closed_intake_with_active_exit_watcher_is_not_stale_selector_alert(self):
+        self.exe.set("intakeState","CLOSED")
+        self.exe.set("workerState","ACTIVE")
+        self.sel.db.execute(
+            "INSERT INTO meta(key,value) VALUES('selectorReady','1')")
+        self.sel.db.execute(
+            "INSERT INTO meta(key,value) VALUES('selectorHeartbeat',?)",
+            (str(time.time()-200),))
+        view=readSnapshot(self.root)
+        self.assertEqual(view["health"]["selectorStatus"],"INTAKE_CLOSED")
+        self.assertFalse(any("heartbeat stale" in a["message"].lower()
+                             for a in view["alerts"]))
+
+    def test_all_position_counts_independent_of_screen_rows_limit(self):
+        for i in range(4):
+            key="extra:"+str(i)
+            token="0x"+f"{i+5:040x}"
+            self.exe.db.execute(
+                "INSERT INTO selections(selectionId,token,decisionAt,event,status)"
+                " VALUES(?,?,?,?,?)",(key,token,float(i),"{}","BOUGHT"))
+            self.exe.db.execute(
+                "INSERT INTO positions(selectionId,token,originalQty,spentWei,boughtAt,lastGrowth,nextDue)"
+                " VALUES(?,?,?,?,?,?,?)",(key,token,"100","100",float(i),float(i),float(i)))
+            self.exe.seedExitStages(key)
+        view=readSnapshot(self.root,limit=1)
+        self.assertEqual(view["counts"]["positions"],4)
+        self.assertEqual(view["counts"]["open"],4)
+        self.assertEqual(len(view["holdings"]),4)
+
+    def test_nominal_budget_counts_all_intents_not_only_visible_recent_txs(self):
+        for i in range(4):
+            kind="BUY" if i<2 else "PROBE_BUY"
+            sid="entry:"+str(i)
+            self.exe.db.execute("""INSERT INTO transactions(
+                intentId,selectionId,kind,state,txHash,raw,nonce,createdAt,lastBroadcast,inputAmount)
+                VALUES(?,?,?,'SENT',?,'0x',?,?,?,'100')""",
+                (sid,sid,kind,"0x"+f"{i+1:064x}",i,float(i),float(i)))
+        view=readSnapshot(self.root,limit=1)
+        self.assertEqual(view["counts"]["sacrificesCommitted"],2)
+        self.assertEqual(view["counts"]["mainCommitted"],2)
+        self.assertEqual(view["counts"]["nominalCommittedGbp"],"0.22")
+
     def test_reorg_revocation_marks_selected_row(self):
         self.sel.revoke(self.key,"POST_DECISION_CHAIN_REORG")
         row=readSnapshot(self.root)["opportunities"][0]
@@ -192,11 +234,11 @@ class MonitorSnapshotTests(unittest.TestCase):
 class MonitorViewTests(unittest.TestCase):
     setUp=MonitorSnapshotTests.setUp
     tearDown=MonitorSnapshotTests.tearDown
-    def draw(self,view,screen,width=220,height=70):
+    def draw(self,view,screen,width=220,height=70,offset=0):
         stream=io.StringIO()
         c=Console(file=stream,force_terminal=False,color_system=None,
                   width=width,height=height)
-        c.print(renderScreen(view,screen=screen,width=width,height=height))
+        c.print(renderScreen(view,screen=screen,width=width,height=height,offset=offset))
         return stream.getvalue()
 
     def test_all_pages_render_complete_identifiers(self):
@@ -217,6 +259,18 @@ class MonitorViewTests(unittest.TestCase):
         self.assertEqual(self.venue["id"].replace("0x","")[:12],self.venue["id"][2:14])
         self.assertNotIn(self.venue["id"][:8]+"…",output)
         self.assertNotIn(self.token[:8]+"…",output)
+
+    def test_scrolling_long_position_screen_reveals_hidden_exit_details(self):
+        self.exe.db.execute("""INSERT INTO positions(
+            selectionId,token,originalQty,spentWei,boughtAt,lastGrowth,nextDue)
+            VALUES(?,?,?,'1',100,100,100)""",(self.key,self.token,"100"))
+        self.exe.seedExitStages(self.key)
+        view=readSnapshot(self.root)
+        above=self.draw(view,"positions",width=130,height=29,offset=0)
+        below=self.draw(view,"positions",width=130,height=29,offset=48)
+        self.assertNotEqual(above,below)
+        self.assertIn("READ ONLY",below)
+        self.assertIn("SCROLL",below)
 
     def test_full_report_all_pages_and_no_false_cash_profit(self):
         view=readSnapshot(self.root)
