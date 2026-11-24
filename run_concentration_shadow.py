@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from pathlib import Path
+from math import ceil
 import json
 import queue
 import sqlite3
@@ -50,6 +51,7 @@ def shadowSummary(directory):
         coverageCompleteDecisions=0,
         observationErrors=[],
         decisionLagSeconds=[],
+        decisionLatency={"count":0,"p50":None,"p95":None,"p99":None,"worst":None},
     )
     selectorDb=directory/"selector.sqlite3"
     if not selectorDb.is_file():
@@ -75,6 +77,16 @@ def shadowSummary(directory):
                     lags.append(round(float(lag),3))
             initial["coverageCompleteDecisions"]=valid
             initial["decisionLagSeconds"]=lags[:50]
+            ordered=sorted(lags)
+            def rank(percentile):
+                return ordered[max(0,ceil(len(ordered)*percentile)-1)] if ordered else None
+            initial["decisionLatency"]={
+                "count":len(ordered),
+                "p50":rank(.50),
+                "p95":rank(.95),
+                "p99":rank(.99),
+                "worst":ordered[-1] if ordered else None,
+            }
             initial["observationErrors"]=[
                 {"candidate":row[0],"reason":row[1][:90]}
                 for row in db.execute(
