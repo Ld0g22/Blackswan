@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from contextlib import redirect_stdout
 import io
+from decimal import Decimal
 import json
 from pathlib import Path
 import sqlite3
@@ -228,6 +229,68 @@ class MonitorViewTests(unittest.TestCase):
         self.assertIn(self.venue["id"],out)
         self.assertIn(self.token,out)
         self.assertIn("UNMEASURED",out)
+
+
+from test_configured_pipeline import ConfiguredFullPipelineTests
+
+
+class RealLifecycleMonitorTests(unittest.IsolatedAsyncioTestCase):
+    """Use the REAL existing executor state machine, mocked only at signer/RPC."""
+
+    asyncSetUp=ConfiguredFullPipelineTests.asyncSetUp
+    asyncTearDown=ConfiguredFullPipelineTests.asyncTearDown
+    selection=ConfiguredFullPipelineTests.selection
+    position=ConfiguredFullPipelineTests.position
+    confirm=ConfiguredFullPipelineTests.confirm
+
+    async def test_sacrifice_buy_and_both_receipt_sales_are_visible(self):
+        root=Path(self.temp.name)
+        (root/"campaign.json").write_text(json.dumps(self.store.configuredCampaign))
+        self.assertEqual(readSnapshot(root)["opportunities"][0]["executionStatus"],
+                         "LAMB_QUEUED")
+        await self.engine.lamb.start(self.selection())
+        a=readSnapshot(root)
+        self.assertEqual(a["opportunities"][0]["executionStatus"],"PROBE_PENDING")
+        self.assertEqual(a["transactions"][0]["kind"],"PROBE_BUY")
+        self.confirm("PROBE_BUY",10)
+        await self.engine.reconcileReceipts()
+        b=readSnapshot(root)
+        self.assertEqual(b["sacrifices"][0]["result"],"PROBE_CONFIRMED")
+        self.store.db.execute(
+            "UPDATE lamb_probes SET confirmedAt=? WHERE selectionId=?",
+            (time.time()-2,self.sid))
+        await self.engine.lamb.check(self.selection())
+        await self.engine.buy(self.selection())
+        self.confirm("BUY",100)
+        await self.engine.reconcileReceipts()
+        c=readSnapshot(root)
+        self.assertEqual(c["holdings"][0]["originalQty"],100)
+        self.assertEqual(c["holdings"][0]["remainingMainQty"],100)
+        self.assertEqual(c["holdings"][0]["mainBuyTx"]["state"],"CONFIRMED")
+        self.routes.valueGbp=Decimal("0.30")
+        await self.engine.checkPosition(self.position())
+        await self.engine.prepareSell(self.position())
+        self.confirm("SELL_1",80,buy=False)
+        await self.engine.reconcileReceipts()
+        d=readSnapshot(root)
+        self.assertEqual(d["holdings"][0]["remainingMainQty"],20)
+        self.assertEqual(d["holdings"][0]["exitSlices"][0]["state"],"SOLD")
+        self.assertIsNotNone(d["holdings"][0]["latestFullSizeGbp"])
+        self.balance=30
+        self.routes.valueGbp=Decimal("0.50")
+        await self.engine.checkPosition(self.position())
+        await self.engine.prepareSell(self.position())
+        self.confirm("SELL_2",20,buy=False)
+        await self.engine.reconcileReceipts()
+        e=readSnapshot(root)
+        self.assertEqual(e["holdings"][0]["remainingMainQty"],0)
+        self.assertFalse(e["holdings"][0]["isOpen"])
+        self.assertEqual([row["state"] for row in e["holdings"][0]["exitSlices"]],
+                         ["SOLD","SOLD"])
+        self.assertEqual(e["counts"]["confirmedSales"],2)
+        self.assertEqual(e["sacrifices"][0]["probeQty"],"10")
+        self.assertEqual(e["finance"]["saleCount"],2)
+        self.assertIsNone(e["finance"]["actualRealisedGbp"])
 
 
 class MonitorCLITests(unittest.TestCase):
