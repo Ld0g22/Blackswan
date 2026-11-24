@@ -222,6 +222,23 @@ class MonitorSnapshotTests(unittest.TestCase):
         self.assertEqual(row["revokeReason"],"POST_DECISION_CHAIN_REORG")
         self.assertIn("REVOKED",row["whyNotBought"])
 
+    def test_shadow_policy_comes_from_actual_decision_even_without_manifest(self):
+        (self.root/"campaign.json").unlink()
+        view=readSnapshot(self.root)
+        output=io.StringIO()
+        Console(file=output,force_terminal=False,width=200).print(
+            renderReport(view,width=200))
+        self.assertIn("SELECTOR concentration",output.getvalue())
+        self.assertIn("CHAIN",output.getvalue())
+
+    def test_empty_folder_does_not_claim_unverified_chain_as_4663(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output=io.StringIO()
+            Console(file=output,force_terminal=False,width=160).print(
+                renderReport(readSnapshot(Path(tmp)),width=160))
+            self.assertIn("CHAIN UNVERIFIED",output.getvalue())
+            self.assertNotIn("CHAIN 4663",output.getvalue())
+
     def test_poor_quality_database_read_returns_warning_and_no_write(self):
         with tempfile.TemporaryDirectory() as tmp:
             p=Path(tmp)
