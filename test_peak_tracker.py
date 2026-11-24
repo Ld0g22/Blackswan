@@ -55,7 +55,10 @@ class WalletSettingsTests(unittest.TestCase):
             # V3 keystore address metadata is plaintext; no private key needed.
             keystore.write_text(json.dumps({'version': 3, 'address': WALLET[2:], 'crypto': {}}))
             (base / '.env').write_text('ROBINHOOD_ALCHEMY_HTTP_URL=https://rpc.example/v2/key\n')
-            with patch.dict(os.environ, {}, clear=True):
+            # Isolate both fallback locations, even when the real machine has wallets.
+            with (patch.dict(os.environ, {}, clear=True),
+                  patch('peak_tracker.Path.home', return_value=base),
+                  patch('peak_tracker.Path.cwd', return_value=base)):
                 url, wallet = loadSettings(base / '.env')
             self.assertEqual(url, 'https://rpc.example/v2/key')
             self.assertEqual(wallet, WALLET)
@@ -75,10 +78,11 @@ class WalletSettingsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / '.env'
             path.write_text('ROBINHOOD_ALCHEMY_HTTP_URL=https://rpc.example/v2/key\n')
-            with patch.dict(os.environ, {}, clear=True):
-                with patch('peak_tracker.Path.cwd', return_value=Path(folder)):
-                    with self.assertRaisesRegex(ValueError, '--wallet-address'):
-                        loadSettings(path)
+            with (patch.dict(os.environ, {}, clear=True),
+                  patch('peak_tracker.Path.home', return_value=Path(folder)),
+                  patch('peak_tracker.Path.cwd', return_value=Path(folder))):
+                with self.assertRaisesRegex(ValueError, '--wallet-address'):
+                    loadSettings(path)
 
 class MathsTests(unittest.TestCase):
     def test_full_position_sell_is_not_a_fraction(self):
