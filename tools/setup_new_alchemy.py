@@ -102,7 +102,6 @@ def parseCredentials(text: str) -> tuple[str,str]:
 
 def requireSameNewCredentials(env: Path, source: Path) -> bool:
     """Fail closed when a runner points at the old/incorrect .env file."""
-    from detector import loadEnv
     env=Path(env).expanduser().resolve()
     source=Path(source).expanduser().resolve()
     if not source.is_file():
@@ -111,8 +110,7 @@ def requireSameNewCredentials(env: Path, source: Path) -> bool:
         raise RuntimeError("PREPARED_NEW_ALCHEMY_ENV_MISSING")
     try:
         expected=parseCredentials(source.read_text(encoding="utf-8"))
-        actualRaw=loadEnv(env)
-        actual=validateAlchemyUrls(actualRaw[HTTP_KEY],actualRaw[WS_KEY])
+        actual=parseCredentials(env.read_text(encoding="utf-8"))
     except (ValueError,TypeError,UnicodeError,OSError) as exc:
         raise RuntimeError("INVALID_NEW_ALCHEMY_CONFIG") from None
     # No URL/API key values are reported in the exception or caller logs.

@@ -20,6 +20,7 @@ from campaign_v3 import defaultCampaign, concentrationCampaign, validateCampaign
 from run_fresh_peaks import (validateWalletFile, detectorReady, startWorker, drain,
                              stopWorkers, newExperimentId, readLines)
 from campaign_config import otherLiveExecutors
+from tools.setup_new_alchemy import SOURCE_DEFAULT,requireSameNewCredentials
 
 
 def selectorCommand(config, root, python, env, detectorDb, selectorDb):
@@ -103,6 +104,9 @@ def startOrResume(args,root):
         requireIdentity(directory,config)
     if not args.arm_live:
         raise ValueError("LIVE_TRADING_REQUIRES_EXPLICIT_--arm-live")
+    if args.env is None:
+        raise ValueError("EXPLICIT_NEW_ALCHEMY_ENV_REQUIRED")
+    requireSameNewCredentials(args.env,args.credentials_source)
 
     python=root/".venv/bin/python"
     if not python.is_file():
@@ -231,7 +235,9 @@ def main():
     parser.add_argument("--selector",choices=("buyingBlocks","concentration"),default="buyingBlocks",help="New campaign template selector only")
     parser.add_argument("--arm-live",action="store_true")
     parser.add_argument("--run-dir",type=Path)
-    parser.add_argument("--env",type=Path,default=Path.home()/"blackswanRH_guarded/.env")
+    parser.add_argument("--env",type=Path,help="Explicit verified NEW Alchemy environment")
+    parser.add_argument("--credentials-source",type=Path,default=SOURCE_DEFAULT,
+                        help="Expected NEW Alchemy source file")
     parser.add_argument("--wallet-file",type=Path,default=Path.home()/"Desktop/wallet.json")
     parser.add_argument("--data-dir",type=Path,default=Path("data"))
     args=parser.parse_args()
