@@ -165,7 +165,7 @@ def readSnapshot(directory,now=None,limit=50,staleAfterSeconds=180):
         # campaign totals. --rows only limits less-critical event displays.
         positions=safeRows(ex,"SELECT * FROM positions ORDER BY boughtAt DESC",
                            (),view,"positions")
-        selections=safeRows(ex,"SELECT selectionId,token,status,reason,decisionAt,event "
+        selections=safeRows(ex,"SELECT selectionId,token,status,reason,decisionAt,event,quoteWei "
                            "FROM selections ORDER BY decisionAt DESC LIMIT ?",
                            (max(100,limit*3),),view,"execution selections")
         selectionById={x["selectionId"]:x for x in selections}
@@ -205,18 +205,26 @@ def readSnapshot(directory,now=None,limit=50,staleAfterSeconds=180):
         view["sales"]=sorted(autoSales+manualFills,
                              key=lambda row:row.get("confirmedAt") or 0,reverse=True)
 
-        quotes=safeRows(ex,"SELECT id,token,phase,at,block,venue_id,status,quantity,"
-                 "out_wei,gbp,multiple,basis,reason "
-                 "FROM observations WHERE phase='SELL' ORDER BY at DESC,id DESC LIMIT ?",
-                 (max(2000,limit*40),),view,"sell quote observations")
+        # Per-position indexed lookup, not a global last-2000 observation
+        # window: a noisy token must never erase a quiet holding's last quote.
         quoteLatest={}
         quoteSuccessful={}
-        for q in quotes:
-            token=q["token"].lower()
-            if token not in quoteLatest:
-                quoteLatest[token]=q
-            if token not in quoteSuccessful and q["status"]=="ONCHAIN_QUOTE_ONLY" and q["gbp"] is not None:
-                quoteSuccessful[token]=q
+        observationColumns=("SELECT id,token,phase,at,block,venue_id,status,quantity,"
+                            "out_wei,gbp,multiple,basis,reason FROM observations ")
+        for position in positions:
+            token=position["token"].lower()
+            rawQty=str(position["originalQty"])
+            latest=safeRows(ex,observationColumns+
+                "WHERE lower(token)=? AND phase='SELL' AND quantity=? "
+                "ORDER BY at DESC,id DESC LIMIT 1",(token,rawQty),
+                view,"latest full-entry-size quote")
+            successful=safeRows(ex,observationColumns+
+                "WHERE lower(token)=? AND phase='SELL' AND quantity=? "
+                "AND status='ONCHAIN_QUOTE_ONLY' AND gbp IS NOT NULL "
+                "ORDER BY at DESC,id DESC LIMIT 1",(token,rawQty),
+                view,"last successful full-entry-size quote")
+            if latest:quoteLatest[token]=latest[0]
+            if successful:quoteSuccessful[token]=successful[0]
         probeRows=safeRows(ex,"SELECT selectionId,token,probeTxHash,confirmedAt,"
                   "probeQty,probeInputWei,lastCheck,passedAt,result,reason "
                   "FROM lamb_probes ORDER BY COALESCE(confirmedAt,lastCheck,0) DESC",
@@ -367,6 +375,7 @@ def readSnapshot(directory,now=None,limit=50,staleAfterSeconds=180):
                 reason=originalSelection.get("reason"),
                 originalQty=original,
                 mainSpentWei=p.get("spentWei"),
+                entryQuotedTokenQtyRaw=originalSelection.get("quoteWei"),
                 boughtAt=p.get("boughtAt"),
                 latestFullSizeGbp=latest["gbp"] if latestValid else None,
                 latestFullSizeMultiple=latest["multiple"] if latestValid else None,
