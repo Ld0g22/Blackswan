@@ -17,6 +17,7 @@ import sqlite3
 import time
 
 from campaign_config import otherLiveExecutors
+from tools.setup_new_alchemy import SOURCE_DEFAULT,requireSameNewCredentials
 from run_configured_campaign import selectorReady
 from run_fresh_peaks import (
     detectorReady,drain,newExperimentId,startWorker,stopWorkers
@@ -108,6 +109,9 @@ def shadowSummary(directory):
 
 
 def runShadow(args):
+    if args.env is None:
+        raise RuntimeError("EXPLICIT_NEW_ALCHEMY_ENV_REQUIRED: supply --env")
+    requireSameNewCredentials(args.env,args.credentials_source)
     if otherLiveExecutors():
         raise RuntimeError("LIVE_EXECUTOR_PRESENT_READ_ONLY_AUDIT_REFUSED")
     root=Path(__file__).resolve().parent
@@ -164,7 +168,9 @@ def runShadow(args):
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command",choices=("run","status"))
-    parser.add_argument("--env",type=Path,default=Path.home()/"blackswanRH_guarded/.env")
+    parser.add_argument("--env",type=Path,help="Explicit env created from NEW Alchemy source")
+    parser.add_argument("--credentials-source",type=Path,default=SOURCE_DEFAULT,
+                        help="Expected NEW Alchemy source (default ~/blackswan-modular/newalchemy.txt)")
     parser.add_argument("--data-dir",type=Path,default=Path("data"))
     parser.add_argument("--run-dir",type=Path)
     parser.add_argument("--duration-seconds",type=int,default=600)

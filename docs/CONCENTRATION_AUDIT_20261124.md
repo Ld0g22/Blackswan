@@ -53,42 +53,50 @@ The selector remains **Uniswap V4-only** and computes exactly the approved trans
 
 **Budget caveat:** `maxNominalSpendGbp` limits nominal input stakes/sacrifices in the transaction journal, **not total ETH spent including network gas, approvals or slippage**. Do not describe £0.06 as an all-in financial ceiling. Actual costs must be reported from confirmed receipts.
 
-## Operator: safe, strictly read-only verification
+## Operator: fresh installation with the NEW Alchemy account (no prior folder required)
 
-Use this **new audit branch** in a new directory, rather than replacing any existing live installation:
+The previous instructions referenced `~/blackswanRH_guarded/.env`, which may contain **old Alchemy credentials**. Do not use it. The canonical **NEW** credentials source previously verified on Robinhood Chain 4663 is:
+
+`~/blackswan-modular/newalchemy.txt`
+
+The following creates a completely new `~/blackswan-concentration-audit` directory and a **different** restricted environment file outside Git:
 
 ```bash
-git clone --branch audit/concentration-live-readiness-20261124 https://github.com/Ld0g22/Blackswan.git ~/blackswan-concentration-audit
-cd ~/blackswan-concentration-audit
+test -f "$HOME/blackswan-modular/newalchemy.txt"
+git clone --branch fix/explicit-new-alchemy-setup-20261124 https://github.com/Ld0g22/Blackswan.git "$HOME/blackswan-concentration-audit"
+cd "$HOME/blackswan-concentration-audit"
 python3.12 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt -r requirements_live.txt
+.venv/bin/python tools/setup_new_alchemy.py --credentials "$HOME/blackswan-modular/newalchemy.txt" --output "$HOME/.config/blackswan/concentration-new-alchemy.env"
 ```
 
-First run a short read-only provider observation, using the existing Alchemy HTTP/WSS config. It does **not** require a wallet file or password:
+The setup utility accepts both HTTP/WSS URLs from `newalchemy.txt` (or its key), verifies **both** using the real provider and checks `eth_chainId == 4663` and a WSS `newHeads` subscription. It refuses conflicting HTTP/WSS API keys, non-Robinhood-Alchemy hosts, insecure schemes, an existing environment with different contents, and outputs no secret URL/key. It never touches the earlier credentials, old installations or keystores. The new env is private (`0600`). If the canonical source file no longer exists, locate or restore the NEW credentials **locally** before continuing; do not paste API keys into chat.
+
+Run the read-only detector + concentration selector against this exact provider source:
 
 ```bash
-.venv/bin/python run_concentration_shadow.py run --env ~/blackswanRH_guarded/.env --duration-seconds 180
+.venv/bin/python run_concentration_shadow.py run --env "$HOME/.config/blackswan/concentration-new-alchemy.env" --credentials-source "$HOME/blackswan-modular/newalchemy.txt" --duration-seconds 180
 ```
 
-The runner creates a new `data/concentration_shadow_*` directory and prints the exact path. It contains raw `detector.sqlite3`, `selector.sqlite3` and `summary.json`. The final summary's `readOnlyChainValidated` flag means **some data passed a chain-ID and event-evidence consistency check**, **not** a live-trading certification. Empty or UNKNOWN results are inconclusive. Review p95/p99 with their sample count and confirm actual data before extending the observation. Provider usage must be checked in the Alchemy dashboard; this build adds **no CU accounting or estimates**.
+This runner refuses missing `--env`, a source mismatch and an old/incorrect environment **before it starts either worker**. It starts no wallet, signer or execution process, and moves no money. It creates a fresh `data/concentration_shadow_*` directory and prints the real location of `summary.json`, `detector.sqlite3` and `selector.sqlite3`. A three-minute observation with no genuine eligible launch does not establish selector completeness. The source file and the output env remain outside the repo. Check Alchemy provider usage on its dashboard; no internal CU estimates are added.
 
-The separate existing **read-only** exact-calldata checks are:
+The separate **read-only** exact calldata/transaction-preflight checks must use the SAME new file:
 
 ```bash
-.venv/bin/python probe_live_execution.py --env ~/blackswanRH_guarded/.env --wallet-file ~/Desktop/wallet.json
-.venv/bin/python lamb_readonly_preflight.py --env ~/blackswanRH_guarded/.env --wallet-file ~/Desktop/wallet.json
+.venv/bin/python probe_live_execution.py --env "$HOME/.config/blackswan/concentration-new-alchemy.env" --wallet-file "$HOME/Desktop/wallet.json"
+.venv/bin/python lamb_readonly_preflight.py --env "$HOME/.config/blackswan/concentration-new-alchemy.env" --wallet-file "$HOME/Desktop/wallet.json"
 ```
 
-These read the public wallet identity and use a dummy signer in the ABI probe, not the actual encrypted private key; neither broadcasts transactions. Any missing real V3/V4 bridge, chain code, RPC, ABI or quote route must be reported as a **failed preflight**, not guessed away.
+These use the public wallet identity and dummy signer for ABI testing; neither broadcasts. A missing keystore or incorrect RPC returns an error; do not infer success.
 
-Once D2/D3 observations are acceptable, create a **config template only** (replace the placeholder with the actual public address before use):
+Only after read-only chain/quote evidence passes, create an **unarmed** one-position concentration campaign configuration:
 
 ```bash
 .venv/bin/python run_configured_campaign.py template --selector concentration --micro-test --wallet-address YOUR_PUBLIC_ADDRESS --config concentration_micro.json
 .venv/bin/python run_configured_campaign.py check --config concentration_micro.json
 ```
 
-No `--arm-live` launch command is supplied here because its required evidence gates are still open. A real-money test always requires a later, separate explicit authorisation and final preflight; do not start it from this report.
+Future `start` and `resume` explicitly require both `--env` and matching `--credentials-source`, as well as separate `--arm-live` user authorisation; there is **no fallback to old provider defaults** in the new launcher. No funded start command is provided here: read-only live checks, transaction preflights and user authorisation remain release gates.
 
 ## Recovery / rollback
 
