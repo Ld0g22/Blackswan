@@ -46,6 +46,22 @@ def selectorCommand(config, root, python, env, detectorDb, selectorDb):
     ]
 
 
+def selectorReady(selectorDb):
+    """A concentration selector is ready only after actual chain-ID validation."""
+    if not Path(selectorDb).is_file():
+        return False
+    try:
+        with sqlite3.connect(
+            f"file:{Path(selectorDb).resolve()}?mode=ro",uri=True,timeout=.5
+        ) as db:
+            metadata=dict(db.execute("SELECT key,value FROM meta"))
+        return (metadata.get("selectorName")=="concentration"
+                and metadata.get("selectorReady")=="1"
+                and time.time()-float(metadata.get("selectorHeartbeat",0))<10)
+    except (sqlite3.Error,ValueError,TypeError,OverflowError):
+        return False
+
+
 def requireIdentity(directory,config):
     """Validate resume without modifying the pre-existing campaign DB."""
     manifest=validateCampaign(json.loads((directory/"campaign.json").read_text()))
@@ -133,10 +149,12 @@ def startOrResume(args,root):
                 config,root,python,env,detDb,selDb),messages)
             workers.append(selector)
             readyDeadline=time.monotonic()+15
-            while not selDb.is_file():
+            while (not selDb.is_file() or
+                   (config["selector"]["name"]=="concentration" and
+                    not selectorReady(selDb))):
                 drain(messages)
                 if selector.poll() is not None or time.monotonic()>readyDeadline:
-                    raise RuntimeError("SELECTOR_STARTUP_FAILED")
+                    raise RuntimeError("SELECTOR_STARTUP_FAILED_OR_WRONG_CHAIN")
                 time.sleep(.05)
         elif not detDb.is_file() or not selDb.is_file():
             raise RuntimeError("RETIRED_SOURCE_JOURNALS_MISSING")

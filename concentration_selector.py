@@ -152,6 +152,11 @@ class ConcentrationSelector(Selector):
                 "INSERT INTO meta(key,value) VALUES('concentrationPolicyHash',?)",(digest,))
             self.store.db.execute(
                 "INSERT INTO meta(key,value) VALUES('selectorName','concentration')")
+        # A previously running process may have set READY. This new process
+        # is *not* ready until it verifies the actual target chain.
+        self.store.db.execute(
+            "INSERT INTO meta(key,value) VALUES('selectorReady','0') "
+            "ON CONFLICT(key) DO UPDATE SET value='0'")
         self.store.db.executescript("""
         CREATE TABLE IF NOT EXISTS concentration_progress(
           eventKey TEXT PRIMARY KEY,nextBlock INTEGER NOT NULL,
@@ -490,30 +495,55 @@ class ConcentrationSelector(Selector):
             await self.unsubscribe(cand)
             self.candidates.pop(cand.eventKey,None)
 
+    def pendingToStart(self, limit):
+        """Never let already-running candidates starve younger launches."""
+        if limit <= 0:
+            return []
+        rows=self.store.db.execute(
+            "SELECT eventKey,data FROM launches WHERE state='PENDING' "
+            "ORDER BY detectedAt,eventKey LIMIT ?",
+            (limit+len(self.candidates),)).fetchall()
+        return [row for row in rows
+                if row["eventKey"] not in self.candidates][:limit]
+
+    def markReady(self,chainId):
+        if chainId!=CHAIN_ID:
+            raise RuntimeError("WRONG_CHAIN")
+        self.store.db.execute(
+            "INSERT INTO meta(key,value) VALUES('selectorHeartbeat',?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(time.time()),))
+        self.store.db.execute(
+            "INSERT INTO meta(key,value) VALUES('selectorReady','1') "
+            "ON CONFLICT(key) DO UPDATE SET value='1'")
+
     async def run(self):
         async with aiohttp.ClientSession() as session:
             self.session=session
             chain=await self.rpc("eth_chainId",[],timeout=8)
             if int(chain,16)!=CHAIN_ID:
                 raise RuntimeError("WRONG_CHAIN")
+            self.markReady(int(chain,16))
             # Pending decisions are resumed from the saved chain block cursor,
             # never rewritten as UNKNOWN merely because the process restarted.
             wsTask=self.spawn(self.websocket())
             reportAt=0.0
+            heartAt=0.0
             try:
                 while not self.stopping.is_set():
                     self.pull()
                     capacity=MAX_ACTIVE_CANDIDATES-len(self.candidates)
                     if capacity>0:
-                        rows=self.store.db.execute(
-                            "SELECT eventKey,data FROM launches WHERE state='PENDING' "
-                            "ORDER BY detectedAt LIMIT ?",(capacity,)).fetchall()
-                        for row in rows:
-                            if row["eventKey"] in self.candidates:continue
+                        for row in self.pendingToStart(capacity):
                             item=json.loads(row["data"])
                             cand=Candidate(row["eventKey"],item["event"],item["venue"])
                             self.candidates[row["eventKey"]]=cand
                             self.spawn(self.observe(cand))
+                    if time.monotonic()-heartAt>5:
+                        heartAt=time.monotonic()
+                        self.store.db.execute(
+                            "UPDATE meta SET value=? WHERE key='selectorHeartbeat'",
+                            (str(time.time()),))
                     if time.monotonic()-self.lastAudit>10:
                         self.lastAudit=time.monotonic()
                         self.spawn(self.auditFinal())
@@ -528,6 +558,8 @@ class ConcentrationSelector(Selector):
                     await asyncio.sleep(0.1)
             finally:
                 self.stopping.set()
+                self.store.db.execute(
+                    "UPDATE meta SET value='0' WHERE key='selectorReady'")
                 wsTask.cancel()
                 for task in list(self.tasks):task.cancel()
                 if self.tasks:await asyncio.gather(*self.tasks,return_exceptions=True)
