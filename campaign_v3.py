@@ -75,15 +75,30 @@ def validateCampaign(raw: dict) -> dict:
         raise ValueError("INVALID_WALLET_ADDRESS")
 
     selector = raw["selector"]
-    _shape(selector, ("name", "decisionSeconds", "maxBuyingBlocks"), "SELECTOR")
-    if selector["name"] not in ("buyingBlocks", "concentration", "integrationOnly"):
+    if not isinstance(selector,dict):
+        raise ValueError("INVALID_SELECTOR_FIELDS")
+    name = selector.get("name")
+    if name == "concentration":
+        _shape(selector, ("name", "policyVersion", "windowAnchor", "windowSeconds",
+                          "maxLargestBuyTransactionShareBps", "firstTradeTimeoutSeconds"),
+               "SELECTOR")
+        if (type(selector["policyVersion"]) is not int or selector["policyVersion"] != 1
+                or selector["windowAnchor"] != "firstTrade"
+                or type(selector["windowSeconds"]) is not int or selector["windowSeconds"] != 30
+                or type(selector["maxLargestBuyTransactionShareBps"]) is not int
+                or selector["maxLargestBuyTransactionShareBps"] != 2500):
+            raise ValueError("UNSUPPORTED_CONCENTRATION_RULE")
+        _integer(selector["firstTradeTimeoutSeconds"], "FIRST_TRADE_TIMEOUT", 30, 3600)
+    elif name in ("buyingBlocks", "integrationOnly"):
+        _shape(selector, ("name", "decisionSeconds", "maxBuyingBlocks"), "SELECTOR")
+        _integer(selector["decisionSeconds"], "SELECTOR_WINDOW", 1, 300)
+        if name == "buyingBlocks":
+            if selector["decisionSeconds"] not in (5, 20) or selector["maxBuyingBlocks"] not in (None, 10):
+                raise ValueError("UNSUPPORTED_BUYING_BLOCK_SELECTOR_POLICY")
+        elif selector["maxBuyingBlocks"] is not None:
+            raise ValueError("SELECTOR_POLICY_DOES_NOT_ACCEPT_BUYING_BLOCKS")
+    else:
         raise ValueError("UNREGISTERED_SELECTOR")
-    _integer(selector["decisionSeconds"], "SELECTOR_WINDOW", 1, 300)
-    if selector["name"] == "buyingBlocks":
-        if selector["decisionSeconds"] not in (5, 20) or selector["maxBuyingBlocks"] not in (None, 10):
-            raise ValueError("UNSUPPORTED_BUYING_BLOCK_SELECTOR_POLICY")
-    elif selector["maxBuyingBlocks"] is not None:
-        raise ValueError("SELECTOR_POLICY_DOES_NOT_ACCEPT_BUYING_BLOCKS")
 
     main = raw["main"]
     _shape(main, ("stakeGbp", "maxPurchases"), "MAIN")
@@ -126,8 +141,8 @@ def validateCampaign(raw: dict) -> dict:
             "multiple": format(multiple.normalize(), "f"),
             "percent": format(percent.normalize(), "f"),
         })
-    if seen != Decimal(100):
-        raise ValueError("EXIT_PERCENTAGES_MUST_SUM_TO_100")
+    if not Decimal(0) < seen <= Decimal(100):
+        raise ValueError("EXIT_PERCENTAGES_EXCEED_100")
 
     execution = raw["execution"]
     _shape(execution, ("entryDeadlineSeconds", "sacrificeDeadlineSeconds"), "EXECUTION")
@@ -155,3 +170,16 @@ def campaignDigest(config: dict) -> str:
     canonical = validateCampaign(config)
     data = json.dumps(canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(data.encode("ascii")).hexdigest()
+
+def concentrationCampaign(wallet: str) -> dict:
+    """New-campaign template; keeps sacrifice-on and all execution settings."""
+    policy = defaultCampaign(wallet)
+    policy["selector"] = {
+        "name": "concentration",
+        "policyVersion": 1,
+        "windowAnchor": "firstTrade",
+        "windowSeconds": 30,
+        "maxLargestBuyTransactionShareBps": 2500,
+        "firstTradeTimeoutSeconds": 300,
+    }
+    return validateCampaign(policy)

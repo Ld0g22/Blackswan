@@ -11,6 +11,7 @@ from pathlib import Path
 import sqlite3
 import time
 from uuid import uuid4
+from campaign_v3 import validateCampaign, campaignDigest
 from campaign_config import (FLEX_KIND, FLEX_POLICY, PILOT_KIND, PILOT_POLICY,
     EARLY_KIND, EARLY_POLICY, flexManifest, pilotManifest, earlyManifest)
 
@@ -28,6 +29,16 @@ def connect(directory):
     meta=dict(db.execute('SELECT key,value FROM meta'))
     manifest=json.loads((directory/'campaign.json').read_text())
     kind=manifest.get('campaignKind')
+    if meta.get("campaignKind")=="CONFIGURED_V3":
+        configured=validateCampaign(manifest)
+        if (meta.get("campaignVersion")!="3"
+                or meta.get("campaignIdentity")!=campaignDigest(configured)):
+            db.close()
+            raise RuntimeError("CONFIGURED_CAMPAIGN_IDENTITY_MISMATCH")
+        if meta.get("manualExitVersion")!="1":
+            db.close()
+            raise RuntimeError("MANUAL_EXIT_ENGINE_NOT_INSTALLED")
+        return db,meta
     if (manifest.get('chainId')!=4663 or
             kind not in ('ONE_50P_LAMB','TWO_50P_LAMB','TWO_50P_2X_LAMB','ONE_20P_2X_LAMB',FLEX_KIND,PILOT_KIND,EARLY_KIND) or
             meta.get('campaignKind')!=kind):
@@ -105,6 +116,12 @@ def display(request,db,directory):
 
 def remainingMain(db,position):
     kind=db.execute("SELECT value FROM meta WHERE key='campaignKind'").fetchone()[0]
+    if kind=="CONFIGURED_V3":
+        auto=sum(int(row[0]) for row in db.execute(
+            "SELECT soldQty FROM exit_slices WHERE selectionId=?",(position['selectionId'],)))
+        manual=sum(int(row[0]) for row in db.execute(
+            "SELECT tokenDebited FROM manual_fills WHERE selectionId=?",(position['selectionId'],)))
+        return max(0,int(position['originalQty'])-auto-manual)
     stages=(3,5) if kind in (PILOT_KIND,EARLY_KIND) else (2,50,100) if kind in ('TWO_50P_2X_LAMB','ONE_20P_2X_LAMB',FLEX_KIND) else (3,5,1000)
     auto=sum(int(position['soldQty'+str(s)]) for s in stages)
     manual=sum(int(row[0]) for row in db.execute(
@@ -197,11 +214,15 @@ def status(db,directory):
     positions=db.execute('SELECT selectionId,token,originalQty FROM positions').fetchall()
     for p in positions:
         kind=dict(db.execute('SELECT key,value FROM meta')).get('campaignKind')
-        stages=(3,5) if kind in (PILOT_KIND,EARLY_KIND) else (2,50,100) if kind in ('TWO_50P_2X_LAMB','ONE_20P_2X_LAMB',FLEX_KIND) else (3,5,1000)
-        columns=','.join('soldQty'+str(s) for s in stages)
-        auto=db.execute('SELECT '+columns+' FROM positions WHERE selectionId=?',
-                        (p['selectionId'],)).fetchone()
-        sold=sum(int(v) for v in auto)
+        if kind=="CONFIGURED_V3":
+            sold=sum(int(row[0]) for row in db.execute(
+                "SELECT soldQty FROM exit_slices WHERE selectionId=?",(p['selectionId'],)))
+        else:
+            stages=(3,5) if kind in (PILOT_KIND,EARLY_KIND) else (2,50,100) if kind in ('TWO_50P_2X_LAMB','ONE_20P_2X_LAMB',FLEX_KIND) else (3,5,1000)
+            columns=','.join('soldQty'+str(s) for s in stages)
+            auto=db.execute('SELECT '+columns+' FROM positions WHERE selectionId=?',
+                            (p['selectionId'],)).fetchone()
+            sold=sum(int(v) for v in auto)
         manual=sum(int(v[0]) for v in db.execute(
             'SELECT tokenDebited FROM manual_fills WHERE selectionId=?',
             (p['selectionId'],)))

@@ -16,7 +16,7 @@ import subprocess
 import threading
 import time
 
-from campaign_v3 import defaultCampaign, validateCampaign, campaignDigest
+from campaign_v3 import defaultCampaign, concentrationCampaign, validateCampaign, campaignDigest
 from run_fresh_peaks import (validateWalletFile, detectorReady, startWorker, drain,
                              stopWorkers, newExperimentId, readLines)
 from campaign_config import otherLiveExecutors
@@ -27,8 +27,16 @@ def selectorCommand(config, root, python, env, detectorDb, selectorDb):
     selector=config["selector"]
     if selector["name"]=="integrationOnly":
         raise ValueError("INTEGRATION_SELECTOR_NOT_LIVE")
+    if selector["name"]=="concentration":
+        return [
+            str(python),"-u",str(root/"concentration_selector.py"),"run",
+            "--env",str(env),"--detector-db",str(detectorDb),"--db",str(selectorDb),
+            "--window-seconds",str(selector["windowSeconds"]),
+            "--threshold-bps",str(selector["maxLargestBuyTransactionShareBps"]),
+            "--first-trade-timeout-seconds",str(selector["firstTradeTimeoutSeconds"]),
+        ]
     if selector["name"]!="buyingBlocks":
-        raise ValueError("SELECTOR_UNAVAILABLE: cannot arm an unimplemented selector")
+        raise ValueError("SELECTOR_UNAVAILABLE")
     return [
         str(python),"-u",str(root/"five_second_selector.py"),"run",
         "--env",str(env),"--detector-db",str(detectorDb),"--db",str(selectorDb),
@@ -36,6 +44,22 @@ def selectorCommand(config, root, python, env, detectorDb, selectorDb):
         *([] if selector["maxBuyingBlocks"] is None else [
             "--max-buying-blocks",str(selector["maxBuyingBlocks"])]),
     ]
+
+
+def selectorReady(selectorDb):
+    """A concentration selector is ready only after actual chain-ID validation."""
+    if not Path(selectorDb).is_file():
+        return False
+    try:
+        with sqlite3.connect(
+            f"file:{Path(selectorDb).resolve()}?mode=ro",uri=True,timeout=.5
+        ) as db:
+            metadata=dict(db.execute("SELECT key,value FROM meta"))
+        return (metadata.get("selectorName")=="concentration"
+                and metadata.get("selectorReady")=="1"
+                and time.time()-float(metadata.get("selectorHeartbeat",0))<10)
+    except (sqlite3.Error,ValueError,TypeError,OverflowError):
+        return False
 
 
 def requireIdentity(directory,config):
@@ -125,10 +149,12 @@ def startOrResume(args,root):
                 config,root,python,env,detDb,selDb),messages)
             workers.append(selector)
             readyDeadline=time.monotonic()+15
-            while not selDb.is_file():
+            while (not selDb.is_file() or
+                   (config["selector"]["name"]=="concentration" and
+                    not selectorReady(selDb))):
                 drain(messages)
                 if selector.poll() is not None or time.monotonic()>readyDeadline:
-                    raise RuntimeError("SELECTOR_STARTUP_FAILED")
+                    raise RuntimeError("SELECTOR_STARTUP_FAILED_OR_WRONG_CHAIN")
                 time.sleep(.05)
         elif not detDb.is_file() or not selDb.is_file():
             raise RuntimeError("RETIRED_SOURCE_JOURNALS_MISSING")
@@ -196,6 +222,7 @@ def main():
     parser.add_argument("command",choices=("template","start","resume","status"))
     parser.add_argument("--config",type=Path)
     parser.add_argument("--wallet-address")
+    parser.add_argument("--selector",choices=("buyingBlocks","concentration"),default="buyingBlocks",help="New campaign template selector only")
     parser.add_argument("--arm-live",action="store_true")
     parser.add_argument("--run-dir",type=Path)
     parser.add_argument("--env",type=Path,default=Path.home()/"blackswanRH_guarded/.env")
@@ -206,7 +233,8 @@ def main():
         if args.command=="template":
             if args.config is None or args.wallet_address is None:
                 parser.error("template requires --config and --wallet-address")
-            config=validateCampaign(defaultCampaign(args.wallet_address))
+            config=(concentrationCampaign(args.wallet_address) if args.selector=="concentration"
+                    else validateCampaign(defaultCampaign(args.wallet_address)))
             if args.config.exists():
                 parser.error("Refusing to overwrite existing campaign config")
             args.config.parent.mkdir(parents=True,exist_ok=True)
@@ -229,6 +257,8 @@ def main():
                                   "workerState":meta.get("workerState"),
                                   "version":meta.get("campaignVersion")},indent=2))
             return
+        if args.selector!="buyingBlocks":
+            parser.error("--selector is for template generation; campaign start/resume reads the frozen config")
         startOrResume(args,Path(__file__).resolve().parent)
     except (ValueError,RuntimeError,OSError,KeyError,json.JSONDecodeError,sqlite3.Error) as exc:
         parser.error(str(exc))

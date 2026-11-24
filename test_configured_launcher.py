@@ -6,7 +6,7 @@ import sys
 import tempfile
 import unittest
 
-from campaign_v3 import defaultCampaign, validateCampaign
+from campaign_v3 import defaultCampaign, concentrationCampaign, validateCampaign
 from run_configured_campaign import selectorCommand
 
 WALLET="0x"+"1"*40
@@ -23,13 +23,15 @@ class ConfiguredLauncherTests(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--detector-db")+1],"/run/detector.sqlite3")
 
     def test_nonexistent_selector_fails_closed_not_runs_arbitrary_code(self):
-        cfg=defaultCampaign(WALLET)
-        cfg["selector"]["name"]="concentration"
-        cfg["selector"]["maxBuyingBlocks"]=None
-        with self.assertRaisesRegex(ValueError,"SELECTOR_UNAVAILABLE"):
-            selectorCommand(validateCampaign(cfg),Path("/repo"),Path("/venv/python"),
+        cfg=concentrationCampaign(WALLET)
+        command=selectorCommand(cfg,Path("/repo"),Path("/venv/python"),
                             Path("/secure.env"),Path("/run/detector"),Path("/run/selector"))
+        self.assertEqual(command[2],"/repo/concentration_selector.py")
+        self.assertEqual(command[command.index("--threshold-bps")+1],"2500")
+        self.assertEqual(command[command.index("--window-seconds")+1],"30")
+        cfg=defaultCampaign(WALLET)
         cfg["selector"]["name"]="integrationOnly"
+        cfg["selector"]["maxBuyingBlocks"]=None
         with self.assertRaisesRegex(ValueError,"INTEGRATION_SELECTOR_NOT_LIVE"):
             selectorCommand(validateCampaign(cfg),Path("/repo"),Path("/venv/python"),
                             Path("/secure.env"),Path("/run/detector"),Path("/run/selector"))
@@ -45,6 +47,20 @@ class ConfiguredLauncherTests(unittest.TestCase):
             saved=validateCampaign(json.loads(config.read_text()))
             self.assertTrue(saved["sacrifice"]["enabled"])
             self.assertEqual(saved["walletPublicAddress"],WALLET)
+
+    def test_concentration_template_is_one_operator_setting_and_preserves_sacrifice(self):
+        script=Path(__file__).with_name("run_configured_campaign.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            output=Path(tmp)/"concentration.json"
+            result=subprocess.run([
+                sys.executable,str(script),"template","--wallet-address",WALLET,
+                "--selector","concentration","--config",str(output)],
+                capture_output=True,text=True,timeout=10)
+            self.assertEqual(result.returncode,0,result.stderr)
+            cfg=validateCampaign(json.loads(output.read_text()))
+            self.assertEqual(cfg["selector"]["name"],"concentration")
+            self.assertEqual(cfg["selector"]["maxLargestBuyTransactionShareBps"],2500)
+            self.assertTrue(cfg["sacrifice"]["enabled"])
 
     def test_start_requires_explicit_arm_without_creating_campaign(self):
         script=Path(__file__).with_name("run_configured_campaign.py")

@@ -42,13 +42,14 @@ class CampaignVersionThreeTests(unittest.TestCase):
         self.assertEqual(result["exits"][0]["multiple"], "1.5")
         self.assertEqual(result["exits"][1]["percent"], "25")
 
-    def test_rejects_unknown_fields_incomplete_ladder_and_unbounded_budget(self):
+    def test_rejects_unknown_fields_overallocated_ladder_and_unbounded_budget(self):
         for modifier in (
             lambda x: x.update(hidden=True),
             lambda x: x["sacrifice"].update(stakeGbp="0"),
             lambda x: x["sacrifice"].update(wait={"unit": "blocks", "value": -1}),
             lambda x: x.update(exits=[{"multiple": "2", "percent": "101"}]),
-            lambda x: x.update(exits=[{"multiple": "2", "percent": "80"}]),
+            lambda x: x.update(exits=[{"multiple": "2", "percent": "80"},
+                                      {"multiple": "3", "percent": "25"}]),
             lambda x: x["main"].update(maxPurchases=0),
             lambda x: x["selector"].update(name="../evil.py"),
             lambda x: x.update(chainId=1),
