@@ -1,7 +1,7 @@
 # BlackSwan — Buyer-Concentration Selector V1 Design
 
 **Date:** 2026-11-24  
-**Status:** design only; no selector implemented or campaign armed  
+**Status:** implemented on `concentration/build-one` and undergoing controlled-test review; no campaign armed; read-only chain verification and real transactions are not yet verified  
 **Target implementation branch:** `build/three-configurable-sacrifice-20261123` (not currently merged to `main`)  
 **Existing contract:** `five_second_selector.SelectorStore`, `LiveExecutor.readSelections`, `campaign_v3.py` and `run_configured_campaign.py`
 
@@ -136,3 +136,12 @@ Wallet/funding logic; sacrifice decisions or amount/wait; quote or route viabili
 Rejected: putting concentration inside `live_executor.py` (breaks interchangeability and delays signing); changing the original buying-block selector to support two policies in one branching state machine (regression risk); inventing wallet ownership by reading pool-level V4 Swap events (not actually proven); launching a separate generic feature collector (unnecessary network traffic and prior failure).
 
 **Open validation issue, not a silent requirement change:** confirm whether the exact historical research cohort measured one launch pool or combined all pools for a token. This design intentionally measures the selected launch pool; cross-pool aggregation is not implemented unless justified by equivalent source evidence and separately approved.
+
+## Implementation disposition (2026-11-24)
+
+- The implementation lives on `concentration/build-one`, with `concentration_selector.py` and unchanged `SelectorStore` / `LiveExecutor.readSelections()` interface.
+- The recovered selector transport is reused (single process WebSocket multiplexer and RPC). Decision evidence is obtained from canonical, bounded 10-block HTTP `eth_getLogs` batches, persisted with block hashes and header timestamps; a past PASS is invalidated on detected reorg.
+- An operational **15-second maximum lag** between the canonical 30-second window close and an actionable PASS prevents old detector recovery from triggering new real-money entry. A stale historical ratio is retained as `hypotheticalStatus` and the result is `UNKNOWN`. This is a safety cutoff, **not** part of the concentration formula or evidence of profitability.
+- The current implementation uses a shared cached chain head and up to 12 active pools, at most two concurrent HTTP scanning tasks. **Representative live provider throughput/CU/latency have not been independently verified**. These remain D3 launch blockers.
+- Concentration policy configuration (first trade, 30 seconds, 2500 basis points, first-trade observation timeout) is frozen per campaign. The old buying-block configuration and execution logic remain independent.
+- An operator can generate a concentration campaign template with `run_configured_campaign.py template --selector concentration`; this does not arm or spend.
