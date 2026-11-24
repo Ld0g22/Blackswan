@@ -28,6 +28,33 @@ class ConcentrationRuntimeTests(unittest.IsolatedAsyncioTestCase):
         pending=self.sel.pendingToStart(2)
         self.assertEqual([row["eventKey"] for row in pending],keys[2:4])
 
+    async def test_slow_post_pass_audit_never_spawns_overlapping_rpc_jobs(self):
+        blocker=asyncio.Event()
+        async def stuckAudit():
+            await blocker.wait()
+        self.sel.auditFinal=stuckAudit
+        self.sel.lastAudit=0.0
+        self.assertTrue(self.sel.scheduleAuditIfIdle(11))
+        await asyncio.sleep(0)
+        self.assertFalse(self.sel.scheduleAuditIfIdle(22))
+        self.assertEqual(len(self.sel.tasks),1)
+        blocker.set()
+        await asyncio.sleep(0.01)
+        self.assertTrue(self.sel.scheduleAuditIfIdle(23))
+        await asyncio.gather(*list(self.sel.tasks),return_exceptions=True)
+
+    async def test_post_pass_audit_updates_last_checked_for_fair_rotation(self):
+        self.sel.wallTime=lambda:100030
+        self.fake([25,25,25,25])
+        await self.sel.scanOnce(self.key)
+        self.sel.store.db.execute(
+            "UPDATE concentration_audits SET lastChecked=0 WHERE eventKey=?",
+            (self.key,))
+        await self.sel.auditFinal()
+        self.assertGreater(self.sel.store.db.execute(
+            "SELECT lastChecked FROM concentration_audits WHERE eventKey=?",
+            (self.key,)).fetchone()[0],0)
+
     async def test_shared_head_cache_suppresses_repeated_rpc_calls(self):
         fake=self.fake([25,25,25,25])
         heads=await asyncio.gather(*[self.sel.head() for _ in range(10)])
