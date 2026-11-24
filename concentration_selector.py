@@ -140,6 +140,7 @@ class ConcentrationSelector(Selector):
         self.silentGate = asyncio.Semaphore(1)
         self.rpcPauseUntil = 0.0
         self.rpcFailureStreak = 0
+        self.lastRpcThrottleAt = 0.0
         self.rpcErrors = Counter()
         self.scanRangeByKey = {}
         self.lastAudit = 0.0
@@ -201,6 +202,10 @@ class ConcentrationSelector(Selector):
         """)
 
     def pauseRpc(self,retryAfter=None):
+        now=time.monotonic()
+        if now-self.lastRpcThrottleAt>30:
+            self.rpcFailureStreak=0
+        self.lastRpcThrottleAt=now
         self.rpcFailureStreak=min(6,self.rpcFailureStreak+1)
         delay=min(16.0,0.5*2**self.rpcFailureStreak)
         try:
@@ -224,11 +229,16 @@ class ConcentrationSelector(Selector):
                     self.rpcErrors[method+":"+reason]+=1
                     if response.status==429 or response.status>=500:
                         self.pauseRpc(response.headers.get("Retry-After"))
+                    elif response.status in (401,402,403):
+                        # Authentication/quota failures cannot be fixed by a
+                        # storm of retries. Leave a durable explicit reason.
+                        self.pauseRpc(30)
                     raise RuntimeError(reason)
                 data=await response.json()
         except (aiohttp.ClientError,asyncio.TimeoutError,ValueError) as exc:
             reason="RPC_TRANSPORT_"+type(exc).__name__
             self.rpcErrors[method+":"+reason]+=1
+            self.pauseRpc()
             raise RuntimeError(reason) from None
         if not isinstance(data,dict) or "error" in data or "result" not in data:
             error=data.get("error") if isinstance(data,dict) else None
@@ -238,8 +248,6 @@ class ConcentrationSelector(Selector):
             if code in (429,-32016):
                 self.pauseRpc()
             raise RuntimeError(reason)
-        if time.monotonic()>=self.rpcPauseUntil:
-            self.rpcFailureStreak=0
         return data["result"]
 
     def hasTradeHint(self,cand):
