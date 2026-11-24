@@ -9,7 +9,10 @@ from five_second_selector import SelectorStore
 from test_concentration_selector import ConcentrationHandoffTests, FakeRpc, swap
 
 
-class ConcentrationEdgeCases(ConcentrationHandoffTests):
+class ConcentrationEdgeCases(unittest.IsolatedAsyncioTestCase):
+    asyncSetUp=ConcentrationHandoffTests.asyncSetUp
+    asyncTearDown=ConcentrationHandoffTests.asyncTearDown
+    fake=ConcentrationHandoffTests.fake
     async def test_window_begins_on_first_sell_not_pool_initialize(self):
         logs=[swap(self.venue,1,1001,0,-50),
               swap(self.venue,2,1002,0,25),

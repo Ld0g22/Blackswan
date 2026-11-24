@@ -10,7 +10,10 @@ from run_configured_campaign import selectorReady
 from test_concentration_selector import ConcentrationHandoffTests
 
 
-class ConcentrationRuntimeTests(ConcentrationHandoffTests):
+class ConcentrationRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    asyncSetUp=ConcentrationHandoffTests.asyncSetUp
+    asyncTearDown=ConcentrationHandoffTests.asyncTearDown
+    fake=ConcentrationHandoffTests.fake
     async def test_pending_scheduler_skips_existing_active_candidates(self):
         keys=[self.key]
         for number in range(2,7):
