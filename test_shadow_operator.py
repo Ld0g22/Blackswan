@@ -38,14 +38,14 @@ class ShadowOperatorTests(unittest.TestCase):
             with sqlite3.connect(root/"selector.sqlite3") as db:
                 db.executescript("""
                   CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT);
-                  CREATE TABLE decisions(status TEXT,data TEXT);
+                  CREATE TABLE decisions(seq INTEGER PRIMARY KEY AUTOINCREMENT,status TEXT,data TEXT);
                   CREATE TABLE concentration_swaps(x INTEGER);
                   CREATE TABLE concentration_progress(eventKey TEXT,lastError TEXT,nextBlock INTEGER);
                 """)
                 db.execute("INSERT INTO meta VALUES('selectorVerifiedChainId','4663')")
                 db.execute("INSERT INTO concentration_swaps VALUES(1)")
                 for lag in (0.5,1.0,5.0,30.0):
-                    db.execute("INSERT INTO decisions VALUES('PASS',?)",(
+                    db.execute("INSERT INTO decisions(status,data) VALUES('PASS',?)",(
                         json.dumps({"coverageComplete":True,
                                     "decisionLagSeconds":lag}),))
             summary=shadowSummary(root)
