@@ -121,7 +121,7 @@ def readSnapshot(directory,now=None,limit=50,staleAfterSeconds=180):
         now=now,directory=str(directory),base=legacy,
         warnings=list(legacy.get("warnings",[])),policy={},
         mode="SHADOW",hasCampaign=False,hasExecution=False,
-        opportunities=[],positions=[],holdings=[],sacrifices=[],transactions=[],
+        opportunities=[],positions=[],holdings=[],sacrifices=[],sacrificesDetailed=[],transactions=[],
         sales=[],manualRequests=[],manualFills=[],alerts=[],
         health={},finance={},meta={},counts={},
         sampleLimit=limit,staleAfterSeconds=staleAfterSeconds
@@ -171,7 +171,11 @@ def readSnapshot(directory,now=None,limit=50,staleAfterSeconds=180):
                        "ORDER BY createdAt DESC LIMIT ?",(max(300,limit*8),),
                        view,"transaction journal")
         for tx in transactionRows:
-            tx["receiptConfirmed"]=bool(tx.pop("receipt",None))
+            receiptText=tx.pop("receipt",None)
+            receipt=unpack(receiptText)
+            tx["receiptRecorded"]=bool(receiptText)
+            tx["receiptConfirmed"]=tx["receiptRecorded"] and tx["state"]=="CONFIRMED"
+            tx["receiptBlock"]=asInt(receipt.get("blockNumber"))
             tx["token"]=selectionById.get(tx["selectionId"],{}).get("token")
         view["transactions"]=transactionRows
         byId=defaultdict(list)
@@ -216,6 +220,45 @@ def readSnapshot(directory,now=None,limit=50,staleAfterSeconds=180):
                   (),view,"sacrifice receipts")
         probesById={p["selectionId"]:p for p in probeRows}
         view["sacrifices"]=probeRows
+        # A sacrifice must appear BEFORE a main purchase, including the
+        # LAMB_QUEUED and PROBE_PENDING states. Do not depend on positions.
+        keys={p["selectionId"] for p in probeRows}
+        keys.update(tx["selectionId"] for tx in transactionRows
+                    if tx["kind"]=="PROBE_BUY")
+        keys.update(r["selectionId"] for r in selections
+                    if r["status"].startswith("PROBE_") or r["status"]=="LAMB_QUEUED")
+        wait=((view["policy"].get("sacrifice") or {}).get("wait") or {})
+        connectedHead=asInt(deMeta.get("lastConnectedHead"))
+        for sid in keys:
+            selection=selectionById.get(sid,{})
+            probe=probesById.get(sid,{})
+            tx=next((entry for entry in byId.get(sid,[])
+                     if entry["kind"]=="PROBE_BUY"),{})
+            payload=unpack(selection.get("event"))
+            receiptBlock=tx.get("receiptBlock")
+            blocksRemaining=None
+            if (wait.get("unit")=="blocks" and receiptBlock is not None
+                    and connectedHead is not None):
+                blocksRemaining=max(0,receiptBlock+asInt(wait.get("value"),0)-connectedHead)
+            status=selection.get("status") or "NOT_IN_EXECUTOR"
+            view["sacrificesDetailed"].append(dict(
+                selectionId=sid,token=selection.get("token") or probe.get("token"),
+                venue=fullVenue(payload),status=status,
+                reason=selection.get("reason") or probe.get("reason"),
+                result=probe.get("result") or status,
+                txHash=probe.get("probeTxHash") or tx.get("txHash"),
+                txState=tx.get("state"),
+                receiptRecorded=tx.get("receiptRecorded",False),
+                receiptBlock=receiptBlock,confirmedAt=probe.get("confirmedAt"),
+                passedAt=probe.get("passedAt"),
+                probeQty=probe.get("probeQty"),
+                nextCheck=probe.get("lastCheck"),
+                waitUnit=wait.get("unit"),waitValue=wait.get("value"),
+                blocksRemaining=blocksRemaining))
+        view["sacrificesDetailed"].sort(
+            key=lambda row:row.get("confirmedAt") or
+                selectionById.get(row["selectionId"],{}).get("decisionAt") or 0,
+            reverse=True)
         venueRows=safeRows(ex,"SELECT token,venueId,data,active FROM venues",
                            (),view,"known trade venues")
         venueByToken=defaultdict(list)
@@ -346,6 +389,7 @@ def readSnapshot(directory,now=None,limit=50,staleAfterSeconds=180):
                 lastCheck=p.get("lastCheck")
             ))
         view["holdings"].sort(key=lambda p:(not p["isOpen"],-(p["boughtAt"] or 0)))
+        view["positions"]=view["holdings"]
         view["counts"]={
             "positions":len(view["holdings"]),
             "open":sum(p["isOpen"] for p in view["holdings"]),
