@@ -256,6 +256,41 @@ def stageCard(stage):
     return a
 
 
+def sacrificeList(view,maxRows=None,offset=0):
+    """Show every sacrifice even when NO MAIN BUY / position exists yet."""
+    records=view.get("sacrificesDetailed",[])
+    shown=records[offset:offset+maxRows if maxRows is not None else None]
+    cards=[]
+    for p in shown:
+        a=Text()
+        a+=idLine("TOKEN",p.get("token"))
+        a+=idLine("VENUE",p.get("venue"))
+        a+=idLine("SELECTION",p.get("selectionId"))
+        a+=words("SELECTION / SACRIFICE",show(p.get("status"))+" / "+show(p.get("result")),
+                 emphasis(p.get("result")))
+        a+=idLine("SACRIFICE TX",p.get("txHash"))
+        a+=words("TRANSACTION STATE / RECEIPT",show(p.get("txState"))+
+                 " / "+show(p.get("receiptRecorded")))
+        a+=words("CONFIRMED / RECEIPT BLOCK",timeUtc(p.get("confirmedAt"))+
+                 " / "+show(p.get("receiptBlock")))
+        a+=words("SACRIFICE QUANTITY",show(p.get("probeQty"))+" raw tokens (never main holdings)")
+        a+=words("SURVIVED AT",timeUtc(p.get("passedAt")))
+        if p.get("waitUnit")=="blocks":
+            wait=(str(p["blocksRemaining"])+" blocks remain" if
+                  p.get("blocksRemaining") is not None else "chain head/receipt block not available")
+            a+=words("SURVIVAL WAIT",show(p.get("waitValue"))+" blocks; "+wait)
+        else:
+            a+=words("SURVIVAL WAIT",show(p.get("waitValue"))+" "+show(p.get("waitUnit")))
+        if p.get("reason"):
+            a+=words("WHY / ERROR",p["reason"],"bold red")
+        cards.append(panel("SACRIFICE • "+show(p.get("result")),a,
+                           "red" if p.get("status") in ("PROBE_FAILED","PROBE_UNVERIFIED") else "cyan"))
+    if not cards:
+        cards=[Text("No sacrifices queued, submitted or confirmed in this run.",style="dim yellow")]
+    return panel(f"SACRIFICE / SURVIVAL GATE • {len(shown)} shown, {len(records)} recorded",
+                 Group(*cards),"cyan")
+
+
 def holdingCard(p,view):
     a=Text()
     a+=idLine("TOKEN",p.get("token"))
@@ -263,6 +298,7 @@ def holdingCard(p,view):
     a+=idLine("SELECTION",p.get("selectionId"))
     a+=words("Lifecycle / original",f"{show(p.get('status'))} | {show(p.get('originalQty'))} receipt-verified raw main tokens",emphasis(p.get("status")))
     a+=words("Remaining MAIN (probe excluded)",str(p.get("remainingMainQty"))+" raw tokens")
+    a+=words("Recorded main transaction spend",show(p.get("mainSpentWei"))+" wei (nominal input, gas separate)")
     a+=words("Bought / last checked",f"{timeUtc(p.get('boughtAt'))} / {timeUtc(p.get('lastCheck'))}")
     a+=idLine("MAIN BUY TX",(p.get("mainBuyTx") or {}).get("txHash"))
     a+=words("MAIN BUY TX STATE",(p.get("mainBuyTx") or {}).get("state"))
@@ -405,8 +441,8 @@ def _pageContent(view,screen,width,height,offset):
     perPage=max(1,min(12,(height-17)//10))
     if screen=="overview":
         left=Group(healthCard(view),decisionList(view,maxRows=1))
-        right=Group(policyCard(view),positionList(view,maxRows=1),
-                    alertList(view,maxRows=1))
+        right=Group(policyCard(view),sacrificeList(view,maxRows=1),
+                    positionList(view,maxRows=1),alertList(view,maxRows=1))
         if width>=155:
             t=Table.grid(expand=True,padding=(0,1))
             t.add_column(ratio=1,overflow="fold")
@@ -414,13 +450,16 @@ def _pageContent(view,screen,width,height,offset):
             t.add_row(left,right)
             return t
         return Group(healthCard(view),decisionList(view,maxRows=1),
-                     positionList(view,maxRows=1),alertList(view,maxRows=1))
+                     sacrificeList(view,maxRows=1),positionList(view,maxRows=1),
+                     alertList(view,maxRows=1))
     if screen=="decisions":
         return Group(healthCard(view),decisionList(view,maxRows=perPage,offset=offset))
     if screen=="positions":
-        return positionList(view,maxRows=max(1,perPage//2),offset=offset)
+        return Group(sacrificeList(view,maxRows=max(1,perPage//2),offset=offset),
+                     positionList(view,maxRows=max(1,perPage//2),offset=offset))
     if screen=="ledger":
-        return Group(financeCard(view),receiptList(view,maxRows=perPage,offset=offset),
+        return Group(financeCard(view),sacrificeList(view,maxRows=perPage,offset=offset),
+                     receiptList(view,maxRows=perPage,offset=offset),
                      saleList(view,maxRows=perPage,offset=offset),
                      panel("MANUAL EXIT REQUESTS",
                            Group(*[words(show(r.get("operation")),
@@ -451,7 +490,7 @@ def renderReport(view,width=220):
     """Unclipped, noninteractive all-pages export; no hidden 'top N' semantics."""
     return Group(viewBanner(view,"FULL REPORT"),scorecard(view),
                  healthCard(view),policyCard(view),
-                 decisionList(view),positionList(view),
+                 decisionList(view),sacrificeList(view),positionList(view),
                  financeCard(view),receiptList(view),saleList(view),
                  panel("MANUAL EXIT REQUESTS",
                        Group(*[words(show(r.get("operation")),
