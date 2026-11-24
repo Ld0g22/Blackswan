@@ -33,6 +33,7 @@ SILENT_POOL_TIMESLICE_SECONDS = 5
 SILENT_POOL_YIELD_SECONDS = 2
 MAX_RPC_CONCURRENCY = 2
 MAX_SCAN_BLOCKS = 512
+HEAD_CACHE_SECONDS = 0.75
 MIN_SCAN_BLOCKS = 10
 DEFAULT_SCAN_BLOCKS = 10
 RANGE_FILL_SECONDS = 1.0
@@ -330,11 +331,11 @@ class ConcentrationSelector(Selector):
     async def head(self):
         """A single shared provider-head query for all active launch pools."""
         now=time.monotonic()
-        if self.cachedHead is not None and now-self.headAt<0.35:
+        if self.cachedHead is not None and now-self.headAt<HEAD_CACHE_SECONDS:
             return self.cachedHead
         async with self.headLock:
             now=time.monotonic()
-            if self.cachedHead is None or now-self.headAt>=0.35:
+            if self.cachedHead is None or now-self.headAt>=HEAD_CACHE_SECONDS:
                 self.cachedHead=int(await self.rpc(
                     "eth_blockNumber",[],timeout=4),16)
                 self.headAt=time.monotonic()
@@ -355,7 +356,13 @@ class ConcentrationSelector(Selector):
             "SELECT startBlock,endBlock,endHash FROM concentration_chunks "
             "WHERE eventKey=? ORDER BY startBlock",(key,)).fetchall()
         headers={} if headers is None else headers
+        launch=self.store.db.execute("SELECT data FROM launches WHERE eventKey=?",(key,)).fetchone()
+        if launch is None:return False
+        expected=int(json.loads(launch["data"])["event"]["blockNumber"])
         for chunk in chunks:
+            if chunk["startBlock"]!=expected or chunk["endBlock"]<expected:
+                raise RuntimeError("COVERAGE_CHECKPOINT_GAP")
+            expected=chunk["endBlock"]+1
             number=chunk["endBlock"]
             if number not in headers:
                 headers[number]=await self._header(number)
@@ -667,7 +674,22 @@ class ConcentrationSelector(Selector):
         rows=self.coverageCandidates()
         if not rows:return False
         if time.monotonic()<self.rpcPauseUntil:return False
-        head=await self.head()
+        try:
+            head=await self.head()
+        except (RuntimeError,ValueError,KeyError,TypeError,aiohttp.ClientError,asyncio.TimeoutError) as exc:
+            reason=(type(exc).__name__+":"+str(exc)[:90]
+                    if isinstance(exc,RuntimeError) else type(exc).__name__)
+            self.stats["headErrors"]+=1
+            if str(exc)!="RPC_BACKOFF_ACTIVE":
+                for row in rows:
+                    self.store.db.execute(
+                        "INSERT OR IGNORE INTO concentration_progress(eventKey,nextBlock,lastError) VALUES(?,?,?)",
+                        (row["eventKey"],row["nextBlock"],reason))
+                    self.store.db.execute(
+                        "UPDATE concentration_progress SET lastError=? WHERE eventKey=?",
+                        (reason,row["eventKey"]))
+            await asyncio.sleep(ACTIVE_RETRY_SECONDS)
+            return False
         group=self.selectCoverageRange(rows,head)
         if not group:return False
         keys=[row["eventKey"] for row in group]
@@ -860,6 +882,8 @@ class ConcentrationSelector(Selector):
             heartAt=0.0
             try:
                 while not self.stopping.is_set():
+                    if self.coverageTask.done():
+                        raise RuntimeError("CONCENTRATION_COVERAGE_WORKER_STOPPED") from self.coverageTask.exception()
                     self.pull()
                     now=self.rotationClock()
                     self.deferUntil={key:until for key,until in self.deferUntil.items() if until>now}
