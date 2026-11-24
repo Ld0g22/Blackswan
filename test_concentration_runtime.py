@@ -46,12 +46,12 @@ class ConcentrationRuntimeTests(unittest.IsolatedAsyncioTestCase):
         for n in range(2,MAX_ACTIVE_CANDIDATES+1):
             ev=dict(self.event,eventKey=self.event["eventKey"]+":"+str(n))
             oldKeys.append(self.sel.store.create(ev,self.venue,float(n)))
-        for key in oldKeys:
+        for index,key in enumerate(oldKeys):
             row=self.sel.store.db.execute(
                 "SELECT data FROM launches WHERE eventKey=?",(key,)).fetchone()
             obj=__import__("json").loads(row["data"])
             candidate=Candidate(key,obj["event"],obj["venue"])
-            candidate.startedAt=100
+            candidate.startedAt=100+index/1000
             self.sel.candidates[key]=candidate
         recent=dict(self.event,eventKey=self.event["eventKey"]+":new")
         fresh=self.sel.store.create(recent,self.venue,100)

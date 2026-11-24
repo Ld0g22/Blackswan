@@ -561,6 +561,10 @@ class ConcentrationSelector(Selector):
         self.store.db.execute(
             "INSERT INTO meta(key,value) VALUES('selectorReady','1') "
             "ON CONFLICT(key) DO UPDATE SET value='1'")
+        self.store.db.execute(
+            "INSERT INTO meta(key,value) VALUES('selectorVerifiedChainId',?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(chainId),))
 
     async def run(self):
         async with aiohttp.ClientSession() as session:
