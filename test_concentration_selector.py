@@ -157,6 +157,15 @@ class ConcentrationHandoffTests(unittest.IsolatedAsyncioTestCase):
             consumer.detector.close()
             store.db.close()
 
+    async def test_historic_30_second_window_cannot_become_fresh_live_pass(self):
+        fake=self.fake([25,25,25,25])
+        self.sel.wallTime=lambda:100060  # The window ended at 100030.
+        await self.sel.scanOnce(self.key)
+        row=self.sel.store.db.execute("SELECT status,data FROM decisions").fetchone()
+        self.assertEqual(row["status"],"UNKNOWN")
+        self.assertEqual(json.loads(row["data"])["reason"],
+                         "CONCENTRATION_WINDOW_TOO_OLD")
+
     async def test_same_transaction_split_swaps_is_fail_not_pass(self):
         logs=[swap(self.venue,1,1000,0,20),swap(self.venue,1,1000,1,20),
               swap(self.venue,2,1001,0,20),swap(self.venue,3,1001,1,20),
