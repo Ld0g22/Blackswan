@@ -161,8 +161,10 @@ def readSnapshot(directory,now=None,limit=50,staleAfterSeconds=180):
         elif not ex and view["hasCampaign"]:
             view["mode"]="CAMPAIGN_NOT_YET_ARMED"
 
-        positions=safeRows(ex,"SELECT * FROM positions ORDER BY boughtAt DESC LIMIT ?",
-                           (limit,),view,"positions")
+        # All positions are required for accurate outstanding holdings and
+        # campaign totals. --rows only limits less-critical event displays.
+        positions=safeRows(ex,"SELECT * FROM positions ORDER BY boughtAt DESC",
+                           (),view,"positions")
         selections=safeRows(ex,"SELECT selectionId,token,status,reason,decisionAt,event "
                            "FROM selections ORDER BY decisionAt DESC LIMIT ?",
                            (max(100,limit*3),),view,"execution selections")
@@ -394,21 +396,31 @@ def readSnapshot(directory,now=None,limit=50,staleAfterSeconds=180):
         view["counts"]={
             "positions":len(view["holdings"]),
             "open":sum(p["isOpen"] for p in view["holdings"]),
-            "unsettledTx":sum(tx["state"] in ("SIGNED","SENT","UNCERTAIN","STUCK")
-                              for tx in transactionRows),
+            "unsettledTx":0,
             "confirmedSales":len(saleWithFinance)
         }
         # 1p sacrifices and 5p mains are counted from durable intents, not
         # inferred from a selection PASS or a theoretical quote.
         stake=asDecimal(view["policy"].get("main",{}).get("stakeGbp"))
         sacrificeStake=asDecimal(view["policy"].get("sacrifice",{}).get("stakeGbp"))
-        countedProbe={tx["selectionId"] for tx in transactionRows if tx["kind"]=="PROBE_BUY"}
-        countedMain={tx["selectionId"] for tx in transactionRows if tx["kind"]=="BUY"}
-        view["counts"]["sacrificesCommitted"]=len(countedProbe)
-        view["counts"]["mainCommitted"]=len(countedMain)
+        # Never derive spend limits from the truncated display journal.
+        # One unique selection per kind counts even after receipt reconciliation.
+        accountingRows=safeRows(ex,
+            "SELECT kind,COUNT(DISTINCT selectionId) AS committed "
+            "FROM transactions WHERE kind IN ('PROBE_BUY','BUY') GROUP BY kind",
+            (),view,"all signed nominal intents")
+        allIntents={r["kind"]:r["committed"] for r in accountingRows}
+        probeCount=allIntents.get("PROBE_BUY",0)
+        mainCount=allIntents.get("BUY",0)
+        view["counts"]["sacrificesCommitted"]=probeCount
+        view["counts"]["mainCommitted"]=mainCount
+        unsettled=safeRows(ex,
+            "SELECT COUNT(*) AS count FROM transactions "
+            "WHERE state IN ('SIGNED','SENT','UNCERTAIN','STUCK')",
+            (),view,"all unsettled transactions")
+        view["counts"]["unsettledTx"]=unsettled[0]["count"] if unsettled else None
         view["counts"]["nominalCommittedGbp"]=(
-            str((stake or Decimal(0))*len(countedMain)
-                +(sacrificeStake or Decimal(0))*len(countedProbe))
+            str(stake*mainCount+sacrificeStake*probeCount)
             if stake is not None and sacrificeStake is not None else None)
 
         execById={row["selectionId"]:mainSelection(row) for row in selections}
@@ -497,7 +509,8 @@ def readSnapshot(directory,now=None,limit=50,staleAfterSeconds=180):
         heartbeat=asDecimal(seMeta.get("selectorHeartbeat"))
         heartAge=(max(0,float(Decimal(str(now))-heartbeat)) if heartbeat is not None else None)
         exeIntake=exMeta.get("intakeState")
-        retired=exeIntake=="CLOSED" and exMeta.get("workerState")=="RETIRED"
+        sourcesClosed=exeIntake=="CLOSED"
+        retired=sourcesClosed and exMeta.get("workerState")=="RETIRED"
         workerPids=findRunWorkers(directory)
         if workerPids["executor"] is not None:
             executorLive=("RUNNING PID "+str(workerPids["executor"]) if
@@ -516,7 +529,7 @@ def readSnapshot(directory,now=None,limit=50,staleAfterSeconds=180):
             detectorDecodeErrors=legacy.get("detector",{}).get("decode"),
             detectorCursor=asInt(seMeta.get("detectorCursor")),
             detectorBacklog=legacy.get("selector",{}).get("backlog"),
-            selectorStatus=("RETIRED" if retired else
+            selectorStatus=("INTAKE_CLOSED" if sourcesClosed else
                             "LIVE_HEARTBEAT" if selectorReady=="1" and
                             heartAge is not None and heartAge<=15 else
                             "STALE" if selectorReady=="1" else "NOT_READY_OR_NOT_STARTED"),
@@ -531,7 +544,7 @@ def readSnapshot(directory,now=None,limit=50,staleAfterSeconds=180):
             watcherState=exMeta.get("venueWatchState"),
             watcherError=exMeta.get("venueWatchError"),
             executorProcessLiveness=executorLive,
-            sourceRetired=retired
+            sourceRetired=sourcesClosed
         )
 
         # A matching PID is only local evidence of a running process, NOT a
@@ -546,7 +559,7 @@ def readSnapshot(directory,now=None,limit=50,staleAfterSeconds=180):
                     message="Multiple exact matching executor PIDs! Verify only one is running",
                     at=None,token=None,txHash=None))
         # Alerts are derived from evidence; they do not imply a live process.
-        if se is not None and selectorReady=="1" and heartAge is not None and heartAge>15 and not retired:
+        if se is not None and selectorReady=="1" and heartAge is not None and heartAge>15 and not sourcesClosed:
             view["alerts"].append(dict(level="CRITICAL",source="SELECTOR",
                                       message="Selector heartbeat stale; verify process before arming",
                                       at=None,token=None,txHash=None))
