@@ -22,7 +22,7 @@ from rich.live import Live
 from rich.table import Table
 from rich.text import Text
 
-from concentration_monitor import keyboard, nextKey, nextNewRun
+from concentration_monitor import keyboard, nextKey
 from monitor_snapshot import readonly, readSnapshot
 from monitor_view import ScrollableContent, renderScreen
 
@@ -108,7 +108,10 @@ def title(text):
 def table(headers, ratios=None):
     t=Table(box=box.SIMPLE,expand=True,padding=(0,1),header_style="bold cyan")
     for i,h in enumerate(headers):
-        t.add_column(h,ratio=ratios[i] if ratios else None,overflow="fold")
+        # Reserve the full 42-character address column on normal/full-screen
+        # terminals. Narrow terminals may wrap identifiers rather than shorten.
+        t.add_column(h,ratio=ratios[i] if ratios else None,overflow="fold",
+                     min_width=42 if h=="TOKEN (FULL ADDRESS)" else None)
     return t
 
 
@@ -123,7 +126,7 @@ def reasons(rows):
 
 
 def holdingsTable(view):
-    t=table(("TOKEN (FULL ADDRESS)","STATE","LATEST £ / ×","PEAK £ / ×","QUOTE AGE","EXITS","SOLD %","RECEIVED £","ERROR"),(6,2,2,2,1,3,1,2,3))
+    t=table(("TOKEN (FULL ADDRESS)","STATE","LATEST £ / ×","PEAK £ / ×","QUOTE AGE","EXITS","SOLD %","AUTO RECEIVED £","ERROR"),(6,2,2,2,1,3,1,2,3))
     stake=(view.get("policy",{}).get("main") or {}).get("stakeGbp")
     for p in view.get("holdings",[]):
         latest=p.get("latestFullSizeGbp")
