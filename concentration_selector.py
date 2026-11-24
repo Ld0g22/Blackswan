@@ -30,6 +30,7 @@ DEFAULT_FIRST_TRADE_TIMEOUT = 300
 MAX_SEAL_DELAY_SECONDS = 60
 MAX_ACTIVE_CANDIDATES = 12
 MAX_RPC_CONCURRENCY = 2
+MAX_ACTIONABLE_DECISION_LAG_SECONDS = 15
 
 
 def concentrationDecision(swaps, firstTradeAt, windowSeconds=30, thresholdBps=2500):
@@ -129,6 +130,7 @@ class ConcentrationSelector(Selector):
         self.headLock = asyncio.Lock()
         self.headAt = 0.0
         self.cachedHead = None
+        self.wallTime = time.time
 
         policy = json.dumps({
             "kind":"concentration","version":POLICY_VERSION,
@@ -427,7 +429,15 @@ class ConcentrationSelector(Selector):
         self.store.db.execute("""INSERT OR REPLACE INTO concentration_audits(
             eventKey,lastBlock,lastHash,lastChecked) VALUES(?,?,?,?)""",
             (key,lastChunk["endBlock"],lastChunk["endHash"],time.time()))
-        self.finish(key,result.pop("status"),result)
+        status=result.pop("status")
+        latency=self.wallTime()-cutoff
+        result["decisionLagSeconds"]=round(max(0,latency),3)
+        if status=="PASS" and latency>MAX_ACTIONABLE_DECISION_LAG_SECONDS:
+            # Historical backfill is evidence, not permission to enter late.
+            result["hypotheticalStatus"]="PASS"
+            result["reason"]="CONCENTRATION_WINDOW_TOO_OLD"
+            status="UNKNOWN"
+        self.finish(key,status,result)
 
     async def auditFinal(self):
         """Conservative post-PASS canonicality monitor, never a buy instruction."""

@@ -105,6 +105,7 @@ class ConcentrationEdgeCases(ConcentrationHandoffTests):
         self.sel.detector.close();self.sel.store.db.close()
         self.sel=ConcentrationSelector(self.detectorPath,self.selectorPath,
             "https://not-used.invalid","wss://not-used.invalid")
+        self.sel.wallTime=lambda:100030
         self.sel.rpc=changed
         await self.sel.scanOnce(self.key)
         self.assertEqual(self.sel.store.db.execute(

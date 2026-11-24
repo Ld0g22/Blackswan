@@ -106,6 +106,7 @@ class ConcentrationHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.venue=eligibleVenues(self.event)[0]
         self.sel=ConcentrationSelector(self.detectorPath,self.selectorPath,
             "https://not-used.invalid","wss://not-used.invalid")
+        self.sel.wallTime=lambda:100030
         self.key=self.event["eventKey"]+":"+self.venue["venueKey"]
         self.sel.pull()
         self.assertEqual(self.sel.store.db.execute(
@@ -194,6 +195,7 @@ class ConcentrationHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.sel.detector.close();self.sel.store.db.close()
         self.sel=ConcentrationSelector(self.detectorPath,self.selectorPath,
             "https://not-used.invalid","wss://not-used.invalid")
+        self.sel.wallTime=lambda:100030
         fake.headers[1002]=100020;fake.headers[1003]=100030
         self.sel.rpc=fake
         await self.sel.scanOnce(self.key)

@@ -38,6 +38,7 @@ class ConcentrationFullRoundTripTests(ConfiguredFullPipelineTests):
         self.concentration=ConcentrationSelector(
             detectorPath,selectorPath,
             "https://not-used.invalid","wss://not-used.invalid")
+        self.concentration.wallTime=lambda:100030
         self.selectorStore=self.concentration.store
         self.concentration.pull()
         self.concentration.rpc=FakeRpc([
