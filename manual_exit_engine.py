@@ -16,7 +16,7 @@ WEI = Decimal(10)**18
 
 def installManualSchema(store):
     """Small additive migration, only for one-50p campaign databases."""
-    if not (store.oneFifty or store.twoFifty or store.oneTwenty2x or store.flexLamb):
+    if not (store.oneFifty or store.twoFifty or store.oneTwenty2x or store.flexLamb or store.configuredCampaign is not None):
         return
     store.db.executescript("""
     CREATE TABLE IF NOT EXISTS manual_requests(
@@ -79,6 +79,10 @@ class ManualExitEngine:
 
     def mainRemaining(self,position):
         sid=position['selectionId']
+        if self.store.configuredCampaign is not None:
+            auto=sum(int(row[0]) for row in self.db.execute(
+                "SELECT soldQty FROM exit_slices WHERE selectionId=?",(sid,)))
+            return max(0,int(position['originalQty'])-auto-self.manualSold(sid))
         stages=(3,5) if self.store.flexPilot else (2,50,100) if self.store.newLadder2x else (3,5,1000)
         automatic=sum(int(position['soldQty'+str(stage)]) for stage in stages)
         return max(0,int(position['originalQty'])-automatic-self.manualSold(sid))

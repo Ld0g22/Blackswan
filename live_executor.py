@@ -457,9 +457,13 @@ class ExecutionStore:
                     for r in self.db.execute("""SELECT token,bestGbp,trigger3,trigger5,trigger1000,
                         sold3,sold5,sold1000,error FROM positions ORDER BY boughtAt DESC LIMIT 6""")]
         if self.configuredCampaign is not None:
-            base['openPositions']=self.db.execute("""SELECT COUNT(*) FROM positions p WHERE NOT EXISTS
-                (SELECT 1 FROM exit_slices e WHERE e.selectionId=p.selectionId GROUP BY e.selectionId
-                 HAVING COUNT(*)=SUM(e.sold))""").fetchone()[0]
+            base['openPositions']=sum(
+                int(p['originalQty']) >
+                sum(int(x[0]) for x in self.db.execute(
+                    "SELECT soldQty FROM exit_slices WHERE selectionId=?",(p['selectionId'],)))
+                +sum(int(x[0]) for x in self.db.execute(
+                    "SELECT tokenDebited FROM manual_fills WHERE selectionId=?",(p['selectionId'],)))
+                for p in self.db.execute("SELECT selectionId,originalQty FROM positions"))
             base['positions']=[{
                 "token":r["token"],"bestGbp":r["bestGbp"],"error":r["error"],
                 "exitSlices":[dict(x) for x in self.db.execute(
@@ -517,7 +521,7 @@ class LiveExecutor:
         self.lamb=LambGate(self,receiptTransfers,waitBlocks=store.probeWaitBlocks) if store.sacrifice else None
         self.venueWatcher=HeldVenueWatcher(self) if store.sacrifice else None
         self.lastVenueCheck=0.0
-        self.manual=ManualExitEngine(self,receiptTransfers) if (store.oneFifty or store.twoFifty or store.oneTwenty2x or store.flexLamb) else None
+        self.manual=ManualExitEngine(self,receiptTransfers) if (store.oneFifty or store.twoFifty or store.oneTwenty2x or store.flexLamb or store.configuredCampaign is not None) else None
         self.finance=CampaignFinance(store,rpc,fx,tx.account.address) if (store.flexPilot or store.configuredCampaign is not None) else None
 
     def ponsOrigin(self,token):
@@ -974,16 +978,22 @@ class LiveExecutor:
         stageInfo=self.store.stageRow(selectionId,stage)
         if stageInfo is None:
             raise RuntimeError("CONFIGURED_EXIT_STAGE_MISSING")
+        sold=sum(int(row['soldQty']) for row in self.store.db.execute(
+            "SELECT soldQty FROM exit_slices WHERE selectionId=? AND sold=1",
+            (selectionId,)))
+        manuallySold=sum(int(r[0]) for r in self.store.db.execute(
+            "SELECT tokenDebited FROM manual_fills WHERE selectionId=?",(selectionId,)))
+        configuredPercent=sum(Decimal(row[0]) for row in self.store.db.execute(
+            "SELECT percent FROM exit_slices WHERE selectionId=?",(selectionId,)))
+        reserve=max(0,original-int((Decimal(original)*configuredPercent/100)
+                                  .to_integral_value(rounding=ROUND_DOWN)))
         if stage==len(self.stages):
-            sold=sum(int(row['soldQty']) for row in
-                self.store.db.execute(
-                    "SELECT soldQty FROM exit_slices WHERE selectionId=? AND sold=1",
-                    (selectionId,)))
-            target=max(0,original-sold)
+            # All unsold automatic allocation only; never spend manual reserve.
+            target=max(0,original-sold-manuallySold-max(0,reserve-manuallySold))
         else:
             target=int((Decimal(original)*Decimal(stageInfo['percent'])/Decimal(100))
                        .to_integral_value(rounding=ROUND_DOWN))
-        return max(0,target)
+        return max(0,min(target,original-sold-manuallySold))
 
     async def prepareSell(self,position):
         selectionId=position['selectionId'];token=position['token']

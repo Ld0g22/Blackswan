@@ -126,8 +126,8 @@ def validateCampaign(raw: dict) -> dict:
             "multiple": format(multiple.normalize(), "f"),
             "percent": format(percent.normalize(), "f"),
         })
-    if seen != Decimal(100):
-        raise ValueError("EXIT_PERCENTAGES_MUST_SUM_TO_100")
+    if not Decimal(0) < seen <= Decimal(100):
+        raise ValueError("EXIT_PERCENTAGES_EXCEED_100")
 
     execution = raw["execution"]
     _shape(execution, ("entryDeadlineSeconds", "sacrificeDeadlineSeconds"), "EXECUTION")
