@@ -84,6 +84,11 @@ def preflight(python,root,env,walletFile,sacrifice):
             raise RuntimeError("READ_ONLY_PREFLIGHT_FAILED: "+script)
 
 
+def resumeNeedsSources(state):
+    """A closed campaign keeps exits running; intake must stay shut on resume."""
+    return state.get("intakeState","OPEN")=="OPEN"
+
+
 def startOrResume(args,root):
     directory=None
     if args.command=="start":
@@ -130,7 +135,7 @@ def startOrResume(args,root):
         if args.command=="resume" and exeDb.is_file():
             with sqlite3.connect(f'file:{exeDb.resolve()}?mode=ro',uri=True,timeout=3) as db:
                 current=dict(db.execute("SELECT key,value FROM meta"))
-            sourceClosed=current.get("intakeState")=="CLOSED" and current.get("workerState")=="RETIRED"
+            sourceClosed=not resumeNeedsSources(current)
         else:
             sourceClosed=False
         detector=selector=None
@@ -219,9 +224,10 @@ def startOrResume(args,root):
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command",choices=("template","start","resume","status"))
+    parser.add_argument("command",choices=("template","check","start","resume","status"))
     parser.add_argument("--config",type=Path)
     parser.add_argument("--wallet-address")
+    parser.add_argument("--micro-test",action="store_true",help="Template only: 1 x £0.05 main, 1 x £0.01 sacrifice, nominal £0.06 cap; excludes gas")
     parser.add_argument("--selector",choices=("buyingBlocks","concentration"),default="buyingBlocks",help="New campaign template selector only")
     parser.add_argument("--arm-live",action="store_true")
     parser.add_argument("--run-dir",type=Path)
@@ -235,11 +241,39 @@ def main():
                 parser.error("template requires --config and --wallet-address")
             config=(concentrationCampaign(args.wallet_address) if args.selector=="concentration"
                     else validateCampaign(defaultCampaign(args.wallet_address)))
+            if args.micro_test:
+                config["main"]={"stakeGbp":"0.05","maxPurchases":1}
+                config["limits"]={"maxSacrifices":1,"maxNominalSpendGbp":"0.06"}
+                config=validateCampaign(config)
             if args.config.exists():
                 parser.error("Refusing to overwrite existing campaign config")
             args.config.parent.mkdir(parents=True,exist_ok=True)
             args.config.write_text(json.dumps(config,indent=2)+"\n")
             print("CONFIG TEMPLATE",args.config,"SACRIFICES ON",flush=True)
+            return
+        if args.micro_test:
+            parser.error("--micro-test applies to template only")
+        if args.command=="check":
+            if args.arm_live:
+                parser.error("check is read-only and does not accept --arm-live")
+            if args.config is None:
+                parser.error("check requires --config")
+            cfg=validateCampaign(json.loads(args.config.read_text()))
+            print(json.dumps({
+                "campaignIdentity":campaignDigest(cfg),
+                "chainId":cfg["chainId"],
+                "selector":cfg["selector"]["name"],
+                "maxPurchases":cfg["main"]["maxPurchases"],
+                "stakeGbp":cfg["main"]["stakeGbp"],
+                "sacrificeEnabled":cfg["sacrifice"]["enabled"],
+                "sacrificeGbp":cfg["sacrifice"]["stakeGbp"],
+                "sacrificeWait":cfg["sacrifice"]["wait"],
+                "maxSacrifices":cfg["limits"]["maxSacrifices"],
+                "nominalLimitGbp":cfg["limits"]["maxNominalSpendGbp"],
+                "gasExcludedFromNominalCap":True,
+                "exitStages":cfg["exits"],
+                "status":"OFFLINE_CONFIG_VALIDATED_NO_RPC_OR_WALLET",
+            },indent=2))
             return
         if args.command=="status":
             if args.run_dir is None:parser.error("status requires --run-dir")

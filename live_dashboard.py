@@ -219,9 +219,16 @@ def snapshot(directory,now=None):
                     sales=len(out['sales']),txStates=byTx,
                     proceedsWeth=proceeds,unmeasuredSales=unmeasured)
                 if configured:
-                    out['summary']['open']=sum(not p.get('exitSlices') or
-                        any(not stage['sold'] for stage in p['exitSlices'])
-                        for p in out['positions'])
+                    # Completion of the automatic ladder is NOT closure when
+                    # an explicit manual reserve still owns unsold main tokens.
+                    for p in out['positions']:
+                        autoSold=sum(number(stage['soldQty'])
+                                     for stage in p.get('exitSlices',[]))
+                        manualSold=number(p.get('manualSold'))
+                        p['mainRemaining']=max(
+                            0,number(p['originalQty'])-autoSold-manualSold)
+                    out['summary']['open']=sum(
+                        p['mainRemaining']>0 for p in out['positions'])
                 if pilot or configured:
                     finance=(rows(ex,"""SELECT f.txHash,f.kind,f.expenseWei,f.gasWei,f.incomeWei,
                         f.incomeAsset,f.incomeBasis,f.fxGbpPerEth,f.fxAt,f.state,f.reason

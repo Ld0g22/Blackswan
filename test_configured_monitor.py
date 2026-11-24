@@ -38,6 +38,30 @@ class ConfiguredMonitorTests(unittest.TestCase):
             self.assertIsNotNone(card_positions(view))
             self.assertIsNotNone(card_lamb(view))
 
+    def test_manual_reserve_remains_an_open_holding_after_all_auto_exits(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp)
+            cfg=defaultCampaign(WALLET)
+            cfg["exits"]=[
+                {"multiple":"2","percent":"80"},
+                {"multiple":"10","percent":"15"},
+            ]
+            store=ExecutionStore(root/"execution.sqlite3",configuredCampaign=validateCampaign(cfg))
+            store.db.execute("""INSERT INTO selections(selectionId,token,decisionAt,event,status)
+                VALUES('reserve',?,1,'{}','BOUGHT')""",(TOKEN,))
+            store.db.execute("""INSERT INTO positions(
+                selectionId,token,originalQty,spentWei,boughtAt,lastGrowth,nextDue)
+                VALUES('reserve',?,'100','1',1,1,1)""",(TOKEN,))
+            store.seedExitStages("reserve")
+            store.db.execute("""UPDATE exit_slices SET sold=1,triggered=1,
+                soldQty=CASE stage WHEN 1 THEN '80' ELSE '15' END
+                WHERE selectionId='reserve'""")
+            self.assertEqual(store.status()["openPositions"],1)
+            store.db.close()
+            monitor=snapshot(root)
+            # 5 unsold main tokens belong to the user, not to the sacrifice.
+            self.assertEqual(monitor["summary"]["open"],1)
+
 
 if __name__=="__main__":
     unittest.main()

@@ -2,7 +2,7 @@ name: Build Three — sacrifice and campaign contract
 
 on:
   push:
-    branches: [build/three-configurable-sacrifice-20261123, concentration/build-one]
+    branches: [build/three-configurable-sacrifice-20261123, concentration/build-one, audit/concentration-live-readiness-20261124]
   pull_request:
 
 jobs:
@@ -16,7 +16,11 @@ jobs:
       - run: python -m pip install -r requirements.txt
       - run: python -m pip install -r requirements_live.txt
       - name: Targeted contract regressions
-        run: python -m unittest -q test_campaign_v3 test_sacrifice_failure_repro test_configured_exits test_configured_launcher test_configured_monitor test_configured_pipeline test_configured_manual test_concentration_selector
+        run: python -m unittest -q test_campaign_v3 test_sacrifice_failure_repro test_configured_exits test_configured_launcher test_configured_monitor test_configured_pipeline test_configured_manual test_concentration_selector test_concentration_runtime test_shadow_operator
+      - name: Static Python imports
+        run: python -m compileall -q concentration_selector.py run_concentration_shadow.py run_configured_campaign.py live_executor.py live_dashboard.py
+      - name: Operator command safety lint
+        run: python tools/check_terminal_commands.py docs/CONCENTRATION_AUDIT_20261124.md
       - name: Historical suites (unchanged)
         run: |
           python -m unittest -q test_lamb_500_block_gate

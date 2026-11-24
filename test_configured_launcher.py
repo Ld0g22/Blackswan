@@ -62,6 +62,43 @@ class ConfiguredLauncherTests(unittest.TestCase):
             self.assertEqual(cfg["selector"]["maxLargestBuyTransactionShareBps"],2500)
             self.assertTrue(cfg["sacrifice"]["enabled"])
 
+    def test_one_position_micro_template_is_capped_and_sacrifice_on(self):
+        script=Path(__file__).with_name("run_configured_campaign.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            output=Path(tmp)/"micro.json"
+            proc=subprocess.run([
+                sys.executable,str(script),"template","--wallet-address",WALLET,
+                "--selector","concentration","--micro-test",
+                "--config",str(output)],
+                capture_output=True,text=True,timeout=10)
+            self.assertEqual(proc.returncode,0,proc.stderr)
+            cfg=validateCampaign(json.loads(output.read_text()))
+            self.assertEqual(cfg["main"],{"stakeGbp":"0.05","maxPurchases":1})
+            self.assertEqual(cfg["limits"],{
+                "maxSacrifices":1,"maxNominalSpendGbp":"0.06"})
+            self.assertTrue(cfg["sacrifice"]["enabled"])
+            self.assertEqual(cfg["sacrifice"]["wait"]["value"],500)
+            self.assertEqual(cfg["selector"]["name"],"concentration")
+
+    def test_check_validates_config_without_arm_wallet_or_processes(self):
+        script=Path(__file__).with_name("run_configured_campaign.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            conf=Path(tmp)/"input.json"
+            conf.write_text(json.dumps(concentrationCampaign(WALLET)))
+            proc=subprocess.run([
+                sys.executable,str(script),"check","--config",str(conf),
+                "--wallet-file",str(Path(tmp)/"nonexistent-key.json"),
+                "--env",str(Path(tmp)/"no.env")],
+                capture_output=True,text=True,timeout=10)
+            self.assertEqual(proc.returncode,0,proc.stderr)
+            summary=json.loads(proc.stdout)
+            self.assertEqual(summary["selector"],"concentration")
+            self.assertTrue(summary["sacrificeEnabled"])
+            self.assertTrue(summary["gasExcludedFromNominalCap"])
+            self.assertEqual(summary["maxPurchases"],5)
+            self.assertEqual(summary["nominalLimitGbp"],"10.00")
+            self.assertFalse((Path(tmp)/"data").exists())
+
     def test_start_requires_explicit_arm_without_creating_campaign(self):
         script=Path(__file__).with_name("run_configured_campaign.py")
         with tempfile.TemporaryDirectory() as tmp:
