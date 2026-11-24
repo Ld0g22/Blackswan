@@ -111,6 +111,7 @@ class ConcentrationSelector(Selector):
         self.httpGate = asyncio.Semaphore(MAX_RPC_CONCURRENCY)
         self.lastAudit = 0.0
         self.stats = Counter()
+        self.validatedCheckpoints = set()
 
         policy = json.dumps({
             "kind":"concentration","version":POLICY_VERSION,
@@ -299,8 +300,10 @@ class ConcentrationSelector(Selector):
             launchAt=state["launchTimestamp"]
         # A restarted candidate never discards the original first-trade
         # observation or treats an unverified batch as complete.
-        if not await self.validateChunks(key):
-            return
+        if key not in self.validatedCheckpoints:
+            if not await self.validateChunks(key):
+                return
+            self.validatedCheckpoints.add(key)
         state=self.store.db.execute(
             "SELECT * FROM concentration_progress WHERE eventKey=?",(key,)).fetchone()
         head=int(await self.rpc("eth_blockNumber",[],timeout=4),16)
@@ -368,9 +371,8 @@ class ConcentrationSelector(Selector):
             return
         cutoff=first["blockTimestamp"]+self.windowSeconds
         if lastChunk["endTimestamp"]<cutoff:
-            if lastChunk["endTimestamp"]>=cutoff+MAX_SEAL_DELAY_SECONDS:
-                self.finish(key,"UNKNOWN",dict(reason="WINDOW_UNAVAILABLE",
-                        coverageComplete=False,evidenceErrors=["RPC_WINDOW_TIMEOUT"]))
+            # A delayed or stalled provider must not cause a false PASS.
+            # The normal scheduler retries and retains the original anchor.
             return
         if not await self.validateChunks(key):
             return

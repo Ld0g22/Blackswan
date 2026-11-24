@@ -31,6 +31,7 @@ class ConfiguredLauncherTests(unittest.TestCase):
         self.assertEqual(command[command.index("--window-seconds")+1],"30")
         cfg=defaultCampaign(WALLET)
         cfg["selector"]["name"]="integrationOnly"
+        cfg["selector"]["maxBuyingBlocks"]=None
         with self.assertRaisesRegex(ValueError,"INTEGRATION_SELECTOR_NOT_LIVE"):
             selectorCommand(validateCampaign(cfg),Path("/repo"),Path("/venv/python"),
                             Path("/secure.env"),Path("/run/detector"),Path("/run/selector"))
