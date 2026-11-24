@@ -3,8 +3,6 @@ import asyncio
 import json
 import time
 import unittest
-from unittest.mock import patch
-from types import SimpleNamespace
 
 from concentration_selector import ConcentrationSelector
 from five_second_selector import Candidate
@@ -121,3 +119,91 @@ class ThroughputTests(unittest.IsolatedAsyncioTestCase):
             await self.sel.scanOnce(self.key)
         self.assertEqual(self.sel.store.db.execute("SELECT COUNT(*) FROM concentration_chunks").fetchone()[0],0)
         self.assertEqual(self.sel.store.db.execute("SELECT COUNT(*) FROM decisions").fetchone()[0],0)
+
+    async def test_silent_five_minute_coverage_finishes_in_six_ranges(self):
+        headers={n:100000+(n-1000)//10 for n in range(1000,4001)}
+        fake=FastChainRpc([],headers)
+        self.sel.rpc=fake
+        self.sel.wallTime=lambda:100300
+        for _ in range(6):
+            await self.sel.scanOnce(self.key)
+        row=self.sel.store.db.execute("SELECT status,data FROM decisions").fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["status"],"UNKNOWN")
+        payload=json.loads(row["data"])
+        self.assertEqual(payload["reason"],"NO_FIRST_TRADE_WITHIN_OBSERVATION_BUDGET")
+        self.assertTrue(payload["coverageComplete"])
+        self.assertEqual(sum(m=="eth_getLogs" for m,p in fake.calls),6)
+
+    async def test_fourteen_overlapping_candidates_keep_correct_independent_results(self):
+        # The actual capture contained a peak of fourteen unresolved candidates.
+        # Two have trades; twelve are quiet. A shared head must not mix pool logs.
+        from concentration_selector import MAX_ACTIVE_CANDIDATES
+        self.assertGreaterEqual(MAX_ACTIVE_CANDIDATES,14)
+        keys=[self.key]
+        venues=[self.venue]
+        for index in range(1,14):
+            venue=dict(self.venue,id="0x"+f"{index+9000:064x}",
+                       venueKey=self.venue["venueKey"]+":"+str(index))
+            event=dict(self.event,eventKey=self.event["eventKey"]+":"+str(index))
+            keys.append(self.sel.store.create(event,venue,time.time()))
+            venues.append(venue)
+        headers={n:100000+(n-1000)//10 for n in range(1000,1301)}
+        logs=[swap(venues[0],i+1,1000+i*30,0,25) for i in range(4)]
+        logs.extend(swap(venues[1],i+11,1000+i*30,0,amount)
+                    for i,amount in enumerate((80,10,5,5)))
+        fake=FastChainRpc(logs,headers)
+        self.sel.rpc=fake
+        async def scan(key):
+            async with self.sel.httpGate:
+                await self.sel.scanOnce(key)
+        await asyncio.gather(*(scan(key) for key in keys))
+        rows=dict(self.sel.store.db.execute("SELECT eventKey,status FROM decisions"))
+        self.assertEqual(rows,{keys[0]:"PASS",keys[1]:"FAIL"})
+        self.assertEqual(self.sel.store.db.execute(
+            "SELECT COUNT(*) FROM launches WHERE state='PENDING'").fetchone()[0],12)
+        self.assertEqual(sum(m=="eth_getLogs" for m,p in fake.calls),14)
+        self.assertEqual(sum(m=="eth_blockNumber" for m,p in fake.calls),1)
+
+    async def test_active_hint_gets_rpc_slot_while_silent_pool_is_busy(self):
+        # Exercise actual observe() admission, not just semaphore properties.
+        now=time.time()
+        self.sel.store.db.execute("UPDATE launches SET detectedAt=?",(now,))
+        keys=[self.key]
+        for index in (1,2):
+            event=dict(self.event,eventKey=self.event["eventKey"]+":slot:"+str(index))
+            keys.append(self.sel.store.create(event,self.venue,now))
+        candidates=[Candidate(key,self.event,self.venue) for key in keys]
+        for cand in candidates:self.sel.candidates[cand.eventKey]=cand
+        silentStarted=asyncio.Event()
+        activeStarted=asyncio.Event()
+        release=asyncio.Event()
+        secondSilentScans=[]
+        async def subscribe(cand):return None
+        async def scan(key):
+            if key==keys[0]:
+                silentStarted.set()
+                await release.wait()
+            elif key==keys[1]:
+                secondSilentScans.append(key)
+                await release.wait()
+            else:
+                activeStarted.set()
+                await release.wait()
+        self.sel.subscribe=subscribe
+        self.sel.scanOnce=scan
+        tasks=[]
+        try:
+            tasks.append(asyncio.create_task(self.sel.observe(candidates[0])))
+            await asyncio.wait_for(silentStarted.wait(),2)
+            tasks.append(asyncio.create_task(self.sel.observe(candidates[1])))
+            # A live hint arrives for the third candidate while silent capacity
+            # is occupied. It must not be queued behind the second quiet pool.
+            self.sel.acceptLog(candidates[2],swap(self.venue,1,1000,0,25),now,"live")
+            tasks.append(asyncio.create_task(self.sel.observe(candidates[2])))
+            await asyncio.wait_for(activeStarted.wait(),2)
+            self.assertEqual(secondSilentScans,[])
+        finally:
+            for task in tasks:task.cancel()
+            await asyncio.gather(*tasks,return_exceptions=True)
+            release.set()
