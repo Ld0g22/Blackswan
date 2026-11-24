@@ -121,6 +121,30 @@ class MonitorSnapshotTests(unittest.TestCase):
         self.assertEqual(p["remainingMainQty"],100)
         self.assertIsNone(p["remainingLiquidationValueGbp"])
 
+    def test_quieter_position_quote_not_lost_behind_other_tokens_history(self):
+        self.exe.db.execute("""INSERT INTO positions(
+            selectionId,token,originalQty,spentWei,boughtAt,lastGrowth,nextDue)
+            VALUES(?,?,?,'1',100,100,100)""",(self.key,self.token,"100"))
+        self.exe.db.execute(
+            "UPDATE selections SET quoteWei='80' WHERE selectionId=?",(self.key,))
+        self.exe.observe(token=self.token,phase="SELL",at=10,block="0x10",
+            venue_id=self.venue["id"],status="ONCHAIN_QUOTE_ONLY",
+            quantity="100",out_wei="100",gbp="1.23",multiple="12.3",
+            basis="EXECUTABLE",reason=None)
+        # A hot competing pool can have thousands of newer observations
+        # while this position still needs its most recent quote displayed.
+        rows=[("0x"+"f"*40,"SELL",i+11,"UNAVAILABLE",None)
+              for i in range(2002)]
+        self.exe.db.executemany(
+            "INSERT INTO observations(token,phase,at,status,reason) VALUES(?,?,?,?,?)",
+            rows)
+        view=readSnapshot(self.root,now=3000,limit=1)
+        holding=view["holdings"][0]
+        self.assertEqual(holding["latestFullSizeGbp"],"1.23")
+        self.assertEqual(holding["entryQuotedTokenQtyRaw"],"80")
+        self.assertEqual(holding["originalQty"],100)
+        self.assertTrue(holding["quoteStale"])
+
     def test_sold_receipt_and_manual_reserve_remain_open(self):
         self.exe.db.execute("""INSERT INTO positions(
             selectionId,token,originalQty,spentWei,boughtAt,lastGrowth,nextDue)
