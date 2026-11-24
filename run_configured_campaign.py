@@ -84,6 +84,11 @@ def preflight(python,root,env,walletFile,sacrifice):
             raise RuntimeError("READ_ONLY_PREFLIGHT_FAILED: "+script)
 
 
+def resumeNeedsSources(state):
+    """A closed campaign keeps exits running; intake must stay shut on resume."""
+    return state.get("intakeState","OPEN")=="OPEN"
+
+
 def startOrResume(args,root):
     directory=None
     if args.command=="start":
@@ -130,7 +135,7 @@ def startOrResume(args,root):
         if args.command=="resume" and exeDb.is_file():
             with sqlite3.connect(f'file:{exeDb.resolve()}?mode=ro',uri=True,timeout=3) as db:
                 current=dict(db.execute("SELECT key,value FROM meta"))
-            sourceClosed=current.get("intakeState")=="CLOSED" and current.get("workerState")=="RETIRED"
+            sourceClosed=not resumeNeedsSources(current)
         else:
             sourceClosed=False
         detector=selector=None
