@@ -108,10 +108,12 @@ def title(text):
 def table(headers, ratios=None):
     t=Table(box=box.SIMPLE,expand=True,padding=(0,1),header_style="bold cyan")
     for i,h in enumerate(headers):
-        # Reserve the full 42-character address column on normal/full-screen
-        # terminals. Narrow terminals may wrap identifiers rather than shorten.
-        t.add_column(h,ratio=ratios[i] if ratios else None,overflow="fold",
-                     min_width=42 if h=="TOKEN (FULL ADDRESS)" else None)
+        # A ratio column is flexible: Rich can shrink it below min_width.
+        # Fix the address column at 42 characters without a flexible ratio.
+        if h=="TOKEN (FULL ADDRESS)":
+            t.add_column(h,width=42,no_wrap=True,overflow="fold")
+        else:
+            t.add_column(h,ratio=ratios[i] if ratios else None,overflow="fold")
     return t
 
 
