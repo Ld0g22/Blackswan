@@ -3,7 +3,7 @@
 **Date:** 2026-11-24  
 **Branch:** `concentration/build-one`  
 **Target:** `build/three-configurable-sacrifice-20261123` (Build Three has not yet been merged into main)  
-**Status:** **D2 — controlled integration tested; NOT LIVE VERIFIED.** No live chain trading, keys, or funded deployment.
+**Status:** **D1 tested plus synthetic full-pipeline integration; NOT fully D2 or LIVE VERIFIED.** No live chain trading, keys, or funded deployment.
 
 ## What has been built
 
@@ -29,7 +29,7 @@ CI Python 3.12 workflow: `Build Three — sacrifice and campaign contract` on th
 
 ## Before a real-money campaign (still required)
 
-1. Real **read-only Robinhood Chain 4663** check: chain ID, actual V4 PoolManager Swap event decoding, canonical timestamps, `eth_getLogs` coverage and provider response to bursts/disconnect/reorg. Confirm latency from end-of-window to PASS (p50/p95/p99) and total provider load at real launch rates; recent-pool and no-trade-pool RPC behaviour can be expensive under the provider's ten-block log-range limit.
+1. Replay captured actual Robinhood V4 Swap and Initialize logs through the exact selector-to-executor pipeline (D2). Then perform a real **read-only Robinhood Chain 4663** check: chain ID, actual V4 PoolManager Swap event decoding, canonical timestamps, `eth_getLogs` coverage and provider response to bursts/disconnect/reorg. Confirm latency from end-of-window to PASS (p50/p95/p99) and total provider load at real launch rates; recent-pool and no-trade-pool RPC behaviour can be expensive under the provider's ten-block log-range limit.
 2. Reconcile equivalent source data against the original historical 25% research cohort. Current implementation is *pool-specific*, not wallet ownership or cross-pool token aggregation. No demonstrated predictive profitability yet.
 3. Close Build Three's separate live readiness gates, then ask for **explicit** one-position, capped real-money D4 approval. No automatic live start, wallet access, or spending in this implementation.
 
