@@ -333,6 +333,9 @@ def holdingCard(p,view):
     a+=idLine("VENUE",p.get("venue"))
     a+=idLine("SELECTION",p.get("selectionId"))
     a+=words("Lifecycle / original",f"{show(p.get('status'))} | {show(p.get('originalQty'))} receipt-verified raw main tokens",emphasis(p.get("status")))
+    a+=words("Entry quote expected / actual fill",
+             show(p.get("entryQuotedTokenQtyRaw"))+" / "+show(p.get("originalQty"))+
+             " raw tokens (quote ≠ confirmed amount)")
     a+=words("Remaining MAIN (probe excluded)",str(p.get("remainingMainQty"))+" raw tokens")
     a+=words("Recorded main transaction spend",show(p.get("mainSpentWei"))+" wei (nominal input, gas separate)")
     a+=words("Bought / last checked",f"{timeUtc(p.get('boughtAt'))} / {timeUtc(p.get('lastCheck'))}")

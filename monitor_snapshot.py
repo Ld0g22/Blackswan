@@ -215,11 +215,11 @@ def readSnapshot(directory,now=None,limit=50,staleAfterSeconds=180):
             token=position["token"].lower()
             rawQty=str(position["originalQty"])
             latest=safeRows(ex,observationColumns+
-                "WHERE lower(token)=? AND phase='SELL' AND quantity=? "
+                "WHERE token=? AND phase='SELL' AND quantity=? "
                 "ORDER BY at DESC,id DESC LIMIT 1",(token,rawQty),
                 view,"latest full-entry-size quote")
             successful=safeRows(ex,observationColumns+
-                "WHERE lower(token)=? AND phase='SELL' AND quantity=? "
+                "WHERE token=? AND phase='SELL' AND quantity=? "
                 "AND status='ONCHAIN_QUOTE_ONLY' AND gbp IS NOT NULL "
                 "ORDER BY at DESC,id DESC LIMIT 1",(token,rawQty),
                 view,"last successful full-entry-size quote")
