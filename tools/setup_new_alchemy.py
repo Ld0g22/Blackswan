@@ -72,6 +72,14 @@ def parseCredentials(text: str) -> tuple[str,str]:
             name=name.strip()
             value=value.strip().strip("'\"")
             values[name]=value
+        elif ":" in line and not line.startswith(("http:", "https:", "wss:")):
+            # The original 20-Nov "newalchemy.txt" used descriptive labels,
+            # e.g. "New Alchemy API key: ..." and "HTTP endpoint: ...".
+            label,value=line.split(":",1)
+            normalized=re.sub(r"[^a-z0-9]","",label.lower())
+            if normalized in ("apikey","alchemyapikey","newalchemyapikey",
+                              "robinhoodalchemyapikey"):
+                values["ALCHEMY_API_KEY"]=value.strip().strip("'\\\"")
 
     def chosen(keys):
         candidates={values[k].strip() for k in keys if isinstance(values.get(k),str)
@@ -90,13 +98,27 @@ def parseCredentials(text: str) -> tuple[str,str]:
     if websocketUrl is None:
         if len(detectedWs)>1:raise ValueError("AMBIGUOUS_WSS_URL")
         websocketUrl=next(iter(detectedWs),None)
-    if not httpUrl and not websocketUrl:
-        key=chosen(("ALCHEMY_API_KEY","ROBINHOOD_ALCHEMY_API_KEY","apiKey","api_key"))
-        if key and re.fullmatch(r"[A-Za-z0-9_-]+",key):
-            httpUrl=f"https://{EXPECTED_HOST}/v2/{key}"
-            websocketUrl=f"wss://{EXPECTED_HOST}/v2/{key}"
-    if not httpUrl or not websocketUrl:
-        raise ValueError("NEW_ALCHEMY_SOURCE_REQUIRES_HTTP_AND_WSS")
+    key=chosen(("ALCHEMY_API_KEY","ROBINHOOD_ALCHEMY_API_KEY","apiKey","api_key"))
+    if key is not None and not re.fullmatch(r"[A-Za-z0-9_-]+",key):
+        raise ValueError("INVALID_ALCHEMY_API_KEY_FORMAT")
+    # Previous successful installers accepted only the new HTTP endpoint and
+    # API key, deriving wss:// for the SAME Alchemy host and key.
+    if httpUrl:
+        urlKey=_token(httpUrl,"https")
+        if key and not secrets.compare_digest(key,urlKey):
+            raise ValueError("NEW_ALCHEMY_API_KEY_ENDPOINT_MISMATCH")
+        if not websocketUrl:
+            websocketUrl=f"wss://{EXPECTED_HOST}/v2/{urlKey}"
+    elif websocketUrl:
+        urlKey=_token(websocketUrl,"wss")
+        if key and not secrets.compare_digest(key,urlKey):
+            raise ValueError("NEW_ALCHEMY_API_KEY_ENDPOINT_MISMATCH")
+        httpUrl=f"https://{EXPECTED_HOST}/v2/{urlKey}"
+    elif key:
+        httpUrl=f"https://{EXPECTED_HOST}/v2/{key}"
+        websocketUrl=f"wss://{EXPECTED_HOST}/v2/{key}"
+    else:
+        raise ValueError("NEW_ALCHEMY_HTTP_ENDPOINT_OR_KEY_MISSING")
     return validateAlchemyUrls(httpUrl,websocketUrl)
 
 
