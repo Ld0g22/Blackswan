@@ -21,8 +21,10 @@ class FastChainRpc(FakeRpc):
             start,end=int(f["fromBlock"],16),int(f["toBlock"],16)
             if end-start+1>self.limit:
                 raise RuntimeError("RPC_HTTP_413")
+            pools=f["topics"][1]
+            pools={pools} if isinstance(pools,str) else set(pools)
             return [raw for raw in self.logs if start<=int(raw["blockNumber"],16)<=end
-                    and raw["topics"][1]==f["topics"][1]]
+                    and raw["topics"][1] in pools]
         return await super().__call__(method,params,timeout)
 
 
@@ -207,3 +209,34 @@ class ThroughputTests(unittest.IsolatedAsyncioTestCase):
             for task in tasks:task.cancel()
             await asyncio.gather(*tasks,return_exceptions=True)
             release.set()
+
+    async def test_free_tier_shared_scan_covers_fourteen_pools_with_one_range_query(self):
+        # Actual chain: about ten blocks/second, 14 unresolved pools, free-tier
+        # maximum of ten blocks per eth_getLogs. All cursors overlap.
+        keys=[self.key]
+        venues=[self.venue]
+        for index in range(1,14):
+            venue=dict(self.venue,id="0x"+f"{index+9000:064x}",
+                       venueKey=self.venue["venueKey"]+":"+str(index))
+            event=dict(self.event,eventKey=self.event["eventKey"]+":shared:"+str(index))
+            keys.append(self.sel.store.create(event,venue,time.time()))
+            venues.append(venue)
+        headers={n:100000+(n-1000)//10 for n in range(1000,1301)}
+        logs=[swap(venues[0],i+1,1000+i*30,0,25) for i in range(4)]
+        logs.extend(swap(venues[1],i+11,1000+i*30,0,amount)
+                    for i,amount in enumerate((80,10,5,5)))
+        fake=FastChainRpc(logs,headers,limit=10)
+        self.sel.rpc=fake
+        self.sel.scanLimit=10
+        for _ in range(31):
+            await self.sel.scanGroup(keys,head=1300)
+        rows=dict(self.sel.store.db.execute("SELECT eventKey,status FROM decisions"))
+        self.assertEqual(rows,{keys[0]:"PASS",keys[1]:"FAIL"})
+        self.assertEqual(self.sel.store.db.execute(
+            "SELECT COUNT(*) FROM launches WHERE state='PENDING'").fetchone()[0],12)
+        ranges=[p[0] for m,p in fake.calls if m=="eth_getLogs"]
+        self.assertEqual(len(ranges),31)
+        self.assertTrue(all(int(p["toBlock"],16)-int(p["fromBlock"],16)<10 for p in ranges))
+        self.assertTrue(all(isinstance(p["topics"][1],list) for p in ranges))
+        self.assertEqual(sum(m=="eth_getBlockByNumber" for m,p in fake.calls),
+                         3*31+1+6)  # shared boundaries; never 14 per-pool revalidations
