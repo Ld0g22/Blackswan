@@ -741,6 +741,9 @@ class LiveExecutor:
                 "UPDATE selections SET status='SKIPPED',reason='MAIN_BUDGET_LIMIT' WHERE selectionId=? AND status='QUEUED'",
                 (selectionId,))
             return
+        if (self.store.configuredCampaign is not None and
+                time.time()<float(self.store.get("buyRetryAfter:"+selectionId,"0"))):
+            return
         try:
             rate=await self.fx.get()
             amountWei=int((self.store.buyGbp/rate*10**18).to_integral_value(rounding=ROUND_DOWN))
@@ -793,6 +796,11 @@ class LiveExecutor:
                                    'ACTIVITY_PASS_PROOF_MISSING_OR_REORGED')
                         print('BUY BLOCKED ACTIVITY PROOF',token,flush=True)
                         return
+                if not self.store.canSpend("BUY"):
+                    self.store.db.execute(
+                        "UPDATE selections SET status='SKIPPED',reason='MAIN_BUDGET_LIMIT' WHERE selectionId=? AND status='QUEUED'",
+                        (selectionId,))
+                    return
                 signed=await self.tx.create('buy:'+selectionId,selectionId,'BUY',transaction,amountWei)
                 self.store.db.execute("UPDATE selections SET status='BUY_PENDING',quoteWei=? WHERE selectionId=?",
                                       (str(quote['output']),selectionId))
@@ -805,7 +813,24 @@ class LiveExecutor:
                 print('BUY NOT CONFIRMED_BY_RPC',token,signed['txHash'],'state='+str(state),flush=True)
         except (RuntimeError,ValueError) as exc:
             reason=str(exc)
-            # Busy wallet may recover within the original 3-second deadline.
+            # A temporary RPC/quote error must not discard a candidate while
+            # its original configured entry deadline remains unexpired.
+            existing=self.store.transactions(selectionId,'BUY')
+            if existing:
+                self.store.db.execute(
+                    "UPDATE selections SET status='BUY_PENDING' WHERE selectionId=?",
+                    (selectionId,))
+                return
+            if (self.store.configuredCampaign is not None and
+                    time.time()-deadlineStart<self.store.entryDeadlineSeconds and
+                    not any(term in reason.upper() for term in
+                            ('PONS_V2','WRONG_CHAIN','UNSUPPORTED','BANNED'))):
+                self.store.db.execute(
+                    "UPDATE selections SET reason=? WHERE selectionId=? AND status='QUEUED'",
+                    (reason[:160],selectionId))
+                self.store.set("buyRetryAfter:"+selectionId,time.time()+0.5)
+                print('BUY RETRYABLE',token,reason[:120],flush=True)
+                return
             if reason=='WALLET_TRANSACTION_IN_FLIGHT' and time.time()-deadlineStart<self.store.entryDeadlineSeconds:
                 return
             self.store.db.execute("UPDATE selections SET status='SKIPPED',reason=? WHERE selectionId=?",
@@ -852,7 +877,7 @@ class LiveExecutor:
                         self.store.db.execute("UPDATE selections SET status='BOUGHT' WHERE selectionId=?",(row['selectionId'],))
                         if self.store.configuredCampaign is not None:
                             self.store.seedExitStages(row['selectionId'])
-                        if getattr(self.store,'sacrifice',False) and self.store.acquired()>=self.store.purchaseLimit:
+                        if (self.store.sacrifice or self.store.configuredCampaign is not None) and self.store.acquired()>=self.store.purchaseLimit:
                             self.store.set('intakeState','CLOSED')
                             self.store.set('intakeClosedAt',now)
                         self.store.db.execute('COMMIT')

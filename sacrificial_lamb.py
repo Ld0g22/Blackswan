@@ -178,11 +178,14 @@ class LambGate:
         if (selection['status']!='LAMB_QUEUED' or not self.store.eligible()
                 or self.revoked(selectionId)):
             return
+        if self.store.transactions(selectionId,'PROBE_BUY'):
+            self.state(selectionId,'PROBE_PENDING')
+            return
         if hasattr(self.store,"canSpend") and not self.store.canSpend("PROBE_BUY"):
             self.state(selectionId,"PROBE_FAILED","SACRIFICE_BUDGET_LIMIT")
             return
-        if self.store.transactions(selectionId,'PROBE_BUY'):
-            self.state(selectionId,'PROBE_PENDING')
+        if (getattr(self.store,'configuredCampaign',None) is not None and
+                time.time()<float(self.store.get("probeRetryAfter:"+selectionId,"0"))):
             return
         reason=self.owner.entryExclusion(token,json.loads(selection['event']))
         if reason:
@@ -196,17 +199,24 @@ class LambGate:
             amountWei=int((getattr(self.store,'probeGbp',PROBE_GBP)/rate*10**18).to_integral_value(rounding=ROUND_DOWN))
             if amountWei<=0:raise RuntimeError('ZERO_PROBE_VALUE')
             quote=(await self.owner.swaps.verifiedBuyCandidates(token,amountWei))[0]
-            if time.time()-selection['decisionAt']>PROBE_ENTRY_SECONDS:
+            if time.time()-selection['decisionAt']>getattr(self.store,'sacrificeDeadlineSeconds',PROBE_ENTRY_SECONDS):
                 raise RuntimeError('MISSED_1P_DEADLINE')
             origin=await self.owner.ponsOnChain(token)
             if origin:raise RuntimeError(origin)
-            if time.time()-selection['decisionAt']>PROBE_ENTRY_SECONDS:
+            if time.time()-selection['decisionAt']>getattr(self.store,'sacrificeDeadlineSeconds',PROBE_ENTRY_SECONDS):
                 raise RuntimeError('MISSED_1P_DEADLINE')
             async with self.owner.intakeLock:
                 fresh=self.store.db.execute('SELECT status FROM selections WHERE selectionId=?',
                                             (selectionId,)).fetchone()
                 if (not fresh or fresh['status']!='LAMB_QUEUED' or
                         not self.store.eligible() or self.revoked(selectionId)):
+                    return
+                if hasattr(self.store,"canSpend") and not self.store.canSpend("PROBE_BUY"):
+                    self.state(selectionId,"PROBE_FAILED","SACRIFICE_BUDGET_LIMIT")
+                    return
+                if time.time()-selection['decisionAt']>getattr(
+                        self.store,'sacrificeDeadlineSeconds',PROBE_ENTRY_SECONDS):
+                    self.state(selectionId,'PROBE_FAILED','MISSED_1P_DEADLINE')
                     return
                 # A durable selection-derived intent is idempotent after restart.
                 signed=await self.owner.tx.create('lamb:'+selectionId,selectionId,'PROBE_BUY',
@@ -220,10 +230,23 @@ class LambGate:
                 print('LAMB 1P SENT',token,signed['txHash'],flush=True)
         except (RuntimeError,ValueError,KeyError,IndexError) as exc:
             reason=str(exc)
-            if reason=='WALLET_TRANSACTION_IN_FLIGHT':
-                # The original 3s deadline continues to apply.
+            signed=self.store.transactions(selectionId,'PROBE_BUY')
+            if signed:
+                # Signing can have succeeded even if the broadcast failed.
+                # Never turn an on-chain-possible outcome into a fresh order.
+                self.state(selectionId,'PROBE_PENDING')
+            elif (getattr(self.store,'configuredCampaign',None) is not None and
+                  not any(term in reason.upper() for term in (
+                      'PONS_V2','WRONG_CHAIN','UNSUPPORTED','INVALID_SELECTION','BANNED')) and
+                  time.time()-selection['decisionAt']<getattr(
+                      self.store,'sacrificeDeadlineSeconds',PROBE_ENTRY_SECONDS)):
+                self.store.db.execute(
+                    "UPDATE selections SET reason=? WHERE selectionId=? AND status='LAMB_QUEUED'",
+                    (reason[:160],selectionId))
+                self.store.set("probeRetryAfter:"+selectionId,time.time()+0.5)
+                print('LAMB RETRYABLE',token,reason[:140],flush=True)
                 return
-            if not self.store.transactions(selectionId,'PROBE_BUY'):
+            elif not signed:
                 self.state(selectionId,'PROBE_FAILED',reason)
             print('LAMB 1P NO BUY',token,reason[:140],flush=True)
 
@@ -374,8 +397,11 @@ class LambGate:
         except (RuntimeError,ValueError,TypeError,KeyError,IndexError) as exc:
             # An unavailable RPC quote is UNKNOWN, never a grant of permission.
             reason=str(exc)[:160]
-            fatal=any(x in reason.upper() for x in
-                      ('NOT_SELLABLE','NO_TWO_WAY','ZERO_PROJECTED','PONS_V2','NO_SELL_ROUTE'))
+            fatal=(any(x in reason.upper() for x in
+                       ('PONS_V2','WRONG_CHAIN','INVALID_SELECTION','BANNED'))
+                   if getattr(self.store,'configuredCampaign',None) is not None
+                   else any(x in reason.upper() for x in
+                       ('NOT_SELLABLE','NO_TWO_WAY','ZERO_PROJECTED','PONS_V2','NO_SELL_ROUTE')))
             verdict='PROBE_FAILED' if fatal else 'PROBE_CONFIRMED'
             if fatal:
                 self.state(selectionId,verdict,reason)
