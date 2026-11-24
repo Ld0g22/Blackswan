@@ -18,7 +18,7 @@ jobs:
       - name: Targeted contract regressions
         run: python -m unittest -q test_campaign_v3 test_sacrifice_failure_repro test_configured_exits test_configured_launcher test_configured_monitor test_configured_pipeline test_configured_manual test_concentration_selector test_concentration_runtime test_shadow_operator test_new_alchemy_setup test_concentration_full_monitor
       - name: Static Python imports
-        run: python -m compileall -q concentration_selector.py run_concentration_shadow.py run_configured_campaign.py live_executor.py live_dashboard.py
+        run: python -m compileall -q concentration_selector.py run_concentration_shadow.py run_configured_campaign.py live_executor.py live_dashboard.py monitor_snapshot.py monitor_view.py concentration_monitor.py
       - name: Operator command safety lint
         run: python tools/check_terminal_commands.py docs/CONCENTRATION_AUDIT_20261124.md
       - name: Historical suites (unchanged)
