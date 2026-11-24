@@ -27,8 +27,16 @@ def selectorCommand(config, root, python, env, detectorDb, selectorDb):
     selector=config["selector"]
     if selector["name"]=="integrationOnly":
         raise ValueError("INTEGRATION_SELECTOR_NOT_LIVE")
+    if selector["name"]=="concentration":
+        return [
+            str(python),"-u",str(root/"concentration_selector.py"),"run",
+            "--env",str(env),"--detector-db",str(detectorDb),"--db",str(selectorDb),
+            "--window-seconds",str(selector["windowSeconds"]),
+            "--threshold-bps",str(selector["maxLargestBuyTransactionShareBps"]),
+            "--first-trade-timeout-seconds",str(selector["firstTradeTimeoutSeconds"]),
+        ]
     if selector["name"]!="buyingBlocks":
-        raise ValueError("SELECTOR_UNAVAILABLE: cannot arm an unimplemented selector")
+        raise ValueError("SELECTOR_UNAVAILABLE")
     return [
         str(python),"-u",str(root/"five_second_selector.py"),"run",
         "--env",str(env),"--detector-db",str(detectorDb),"--db",str(selectorDb),

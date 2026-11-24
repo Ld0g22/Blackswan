@@ -263,8 +263,8 @@ class ConcentrationSelector(Selector):
     def finish(self,key,status,extras):
         payload=dict(policyName="concentration",policyVersion=POLICY_VERSION,
                      windowAnchor="firstTrade",windowSeconds=self.windowSeconds,
-                     maxLargestBuyTransactionShareBps=self.thresholdBps,
-                     **extras)
+                     maxLargestBuyTransactionShareBps=self.thresholdBps)
+        payload.update(extras)
         if self.store.decide(key,status,payload):
             self.stats[status]+=1
             print("CONCENTRATION",status,"key",key[:27],
