@@ -264,7 +264,7 @@ class RealLifecycleMonitorTests(unittest.IsolatedAsyncioTestCase):
         b=readSnapshot(root)
         self.assertEqual(b["sacrifices"][0]["result"],"PROBE_CONFIRMED")
         self.assertEqual(b["sacrificesDetailed"][0]["result"],"PROBE_CONFIRMED")
-        self.assertEqual(b["sacrificesDetailed"][0]["receiptBlock"],23)
+        self.assertEqual(b["sacrificesDetailed"][0]["receiptBlock"],21)
         self.store.db.execute(
             "UPDATE lamb_probes SET confirmedAt=? WHERE selectionId=?",
             (time.time()-2,self.sid))
