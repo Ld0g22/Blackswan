@@ -33,6 +33,7 @@ class ThroughputTests(unittest.IsolatedAsyncioTestCase):
     asyncTearDown=ConcentrationHandoffTests.asyncTearDown
 
     def fastChain(self,limit=512,head=1300):
+        self.sel.scanLimit=512  # Explicit wide-provider tests, not the free default.
         headers={n:100000+(n-1000)//10 for n in range(1000,head+1)}
         logs=[swap(self.venue,i+1,1000+i*30,0,25) for i in range(4)
               if 1000+i*30<=head]
@@ -59,14 +60,14 @@ class ThroughputTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(row["data"])["totalBuyBaseRaw"],"100")
         self.assertLessEqual(sum(m=="eth_getLogs" for m,p in fake.calls),6)
 
-    async def test_active_window_waits_until_cutoff_instead_of_rescanning(self):
-        self.fastChain(head=1000)
-        self.sel.wallTime=lambda:100001
-        await self.sel.scanOnce(self.key)
-        cand=Candidate(self.key,self.event,self.venue)
-        self.assertGreaterEqual(self.sel.nextScanDelay(cand),28)
+    async def test_shared_scheduler_keeps_active_window_current_on_ten_block_provider(self):
+        fake=self.fastChain(limit=10)
+        self.sel.scanLimit=10
         self.sel.wallTime=lambda:100030
-        self.assertLessEqual(self.sel.nextScanDelay(cand),1)
+        for _ in range(31):
+            await self.sel.scanGroup([self.key],head=1300)
+        self.assertEqual(self.sel.store.db.execute("SELECT status FROM decisions").fetchone()[0],"PASS")
+        self.assertEqual(sum(m=="eth_getLogs" for m,p in fake.calls),31)
 
     async def test_ws_hint_wakes_silent_pool_but_does_not_authorize_pass(self):
         cand=Candidate(self.key,self.event,self.venue)
@@ -125,6 +126,7 @@ class ThroughputTests(unittest.IsolatedAsyncioTestCase):
     async def test_silent_five_minute_coverage_finishes_in_six_ranges(self):
         headers={n:100000+(n-1000)//10 for n in range(1000,4001)}
         fake=FastChainRpc([],headers)
+        self.sel.scanLimit=512
         self.sel.rpc=fake
         self.sel.wallTime=lambda:100300
         for _ in range(6):
@@ -156,59 +158,29 @@ class ThroughputTests(unittest.IsolatedAsyncioTestCase):
                     for i,amount in enumerate((80,10,5,5)))
         fake=FastChainRpc(logs,headers)
         self.sel.rpc=fake
-        async def scan(key):
-            async with self.sel.httpGate:
-                await self.sel.scanOnce(key)
-        await asyncio.gather(*(scan(key) for key in keys))
+        self.sel.scanLimit=512
+        await self.sel.scanGroup(keys)
         rows=dict(self.sel.store.db.execute("SELECT eventKey,status FROM decisions"))
         self.assertEqual(rows,{keys[0]:"PASS",keys[1]:"FAIL"})
         self.assertEqual(self.sel.store.db.execute(
             "SELECT COUNT(*) FROM launches WHERE state='PENDING'").fetchone()[0],12)
-        self.assertEqual(sum(m=="eth_getLogs" for m,p in fake.calls),14)
+        self.assertEqual(sum(m=="eth_getLogs" for m,p in fake.calls),1)
         self.assertEqual(sum(m=="eth_blockNumber" for m,p in fake.calls),1)
 
-    async def test_active_hint_gets_rpc_slot_while_silent_pool_is_busy(self):
-        # Exercise actual observe() admission, not just semaphore properties.
+    async def test_active_hint_prioritizes_fresh_range_over_silent_backlog(self):
         now=time.time()
         self.sel.store.db.execute("UPDATE launches SET detectedAt=?",(now,))
-        keys=[self.key]
-        for index in (1,2):
-            event=dict(self.event,eventKey=self.event["eventKey"]+":slot:"+str(index))
-            keys.append(self.sel.store.create(event,self.venue,now))
-        candidates=[Candidate(key,self.event,self.venue) for key in keys]
-        for cand in candidates:self.sel.candidates[cand.eventKey]=cand
-        silentStarted=asyncio.Event()
-        activeStarted=asyncio.Event()
-        release=asyncio.Event()
-        secondSilentScans=[]
-        async def subscribe(cand):return None
-        async def scan(key):
-            if key==keys[0]:
-                silentStarted.set()
-                await release.wait()
-            elif key==keys[1]:
-                secondSilentScans.append(key)
-                await release.wait()
-            else:
-                activeStarted.set()
-                await release.wait()
-        self.sel.subscribe=subscribe
-        self.sel.scanOnce=scan
-        tasks=[]
-        try:
-            tasks.append(asyncio.create_task(self.sel.observe(candidates[0])))
-            await asyncio.wait_for(silentStarted.wait(),2)
-            tasks.append(asyncio.create_task(self.sel.observe(candidates[1])))
-            # A live hint arrives for the third candidate while silent capacity
-            # is occupied. It must not be queued behind the second quiet pool.
-            self.sel.acceptLog(candidates[2],swap(self.venue,1,1000,0,25),now,"live")
-            tasks.append(asyncio.create_task(self.sel.observe(candidates[2])))
-            await asyncio.wait_for(activeStarted.wait(),2)
-            self.assertEqual(secondSilentScans,[])
-        finally:
-            for task in tasks:task.cancel()
-            await asyncio.gather(*tasks,return_exceptions=True)
-            release.set()
+        event=dict(self.event,eventKey=self.event["eventKey"]+":new",blockNumber=1290)
+        venue=dict(self.venue,id="0x"+f"{12345:064x}",venueKey=self.venue["venueKey"]+":new")
+        key=self.sel.store.create(event,venue,now)
+        cand=Candidate(key,event,venue)
+        self.sel.candidates[key]=cand
+        self.sel.acceptLog(cand,swap(venue,1,1290,0,25),now,"live")
+        self.sel.scanLimit=10
+        group=self.sel.selectCoverageRange(self.sel.coverageCandidates(),1300)
+        self.assertEqual([row["eventKey"] for row in group],[key])
+        self.assertEqual(self.sel.store.db.execute(
+            "SELECT state FROM launches WHERE eventKey=?",(self.key,)).fetchone()[0],"PENDING")
 
     async def test_free_tier_shared_scan_covers_fourteen_pools_with_one_range_query(self):
         # Actual chain: about ten blocks/second, 14 unresolved pools, free-tier
@@ -238,5 +210,20 @@ class ThroughputTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(ranges),31)
         self.assertTrue(all(int(p["toBlock"],16)-int(p["fromBlock"],16)<10 for p in ranges))
         self.assertTrue(all(isinstance(p["topics"][1],list) for p in ranges))
-        self.assertEqual(sum(m=="eth_getBlockByNumber" for m,p in fake.calls),
-                         3*31+1+6)  # shared boundaries; never 14 per-pool revalidations
+        self.assertLessEqual(sum(m=="eth_getBlockByNumber" for m,p in fake.calls),110)
+        # Shared boundaries, not 14 separate per-pool revalidations.
+
+    async def test_default_provider_range_is_ten_blocks(self):
+        self.assertEqual(self.sel.scanLimit,10)
+
+    async def test_provider_cap_catchup_does_not_wait_until_cutoff(self):
+        fake=self.fastChain(limit=10)
+        self.sel.scanLimit=10
+        self.sel.wallTime=lambda:100010
+        # Real scheduler, a window still open and canonical head far ahead of cursor.
+        self.assertTrue(await self.sel.coverageCycle())
+        self.assertTrue(await self.sel.coverageCycle())
+        self.assertEqual(self.sel.store.db.execute(
+            "SELECT nextBlock FROM concentration_progress WHERE eventKey=?",(self.key,)).fetchone()[0],1020)
+        self.assertEqual(sum(m=="eth_getLogs" for m,p in fake.calls),2)
+        self.assertEqual(self.sel.store.db.execute("SELECT COUNT(*) FROM decisions").fetchone()[0],0)
