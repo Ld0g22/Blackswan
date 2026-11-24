@@ -32,6 +32,29 @@ class ShadowOperatorTests(unittest.TestCase):
             self.assertEqual(result["decisions"],{})
             self.assertFalse(result["readOnlyChainValidated"])
 
+    def test_shadow_summary_reports_p95_p99_with_actual_sample_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            with sqlite3.connect(root/"selector.sqlite3") as db:
+                db.executescript("""
+                  CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT);
+                  CREATE TABLE decisions(status TEXT,data TEXT);
+                  CREATE TABLE concentration_swaps(x INTEGER);
+                  CREATE TABLE concentration_progress(eventKey TEXT,lastError TEXT,nextBlock INTEGER);
+                """)
+                db.execute("INSERT INTO meta VALUES('selectorVerifiedChainId','4663')")
+                db.execute("INSERT INTO concentration_swaps VALUES(1)")
+                for lag in (0.5,1.0,5.0,30.0):
+                    db.execute("INSERT INTO decisions VALUES('PASS',?)",(
+                        json.dumps({"coverageComplete":True,
+                                    "decisionLagSeconds":lag}),))
+            summary=shadowSummary(root)
+            self.assertEqual(summary["decisionLatency"]["count"],4)
+            self.assertEqual(summary["decisionLatency"]["p50"],1.0)
+            self.assertEqual(summary["decisionLatency"]["p95"],30.0)
+            self.assertEqual(summary["decisionLatency"]["p99"],30.0)
+            self.assertEqual(summary["decisionLatency"]["worst"],30.0)
+
     def test_command_line_safely_advertises_read_only_mode(self):
         script=Path(__file__).with_name("run_concentration_shadow.py")
         process=subprocess.run([sys.executable,str(script),"--help"],
