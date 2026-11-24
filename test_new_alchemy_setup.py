@@ -39,23 +39,23 @@ class NewAlchemyCredentialTests(unittest.TestCase):
     def test_actual_prior_source_shape_key_and_http_only_derives_wss(self):
         # 2026-11-20: newalchemy.txt contained API key AND HTTP endpoint.
         # The working old installer derived WS rather than requiring it.
-        src="New Alchemy API key: realNewKey123\\nHTTP endpoint: "+http("realNewKey123")+"\\n"
+        src="New Alchemy API key: realNewKey123\nHTTP endpoint: "+http("realNewKey123")+"\n"
         self.assertEqual(parseCredentials(src),
                          (http("realNewKey123"),wss("realNewKey123")))
 
     def test_only_http_endpoint_derives_wss(self):
-        self.assertEqual(parseCredentials("HTTP endpoint: "+http("onlyHttp")+"\\n"),
+        self.assertEqual(parseCredentials("HTTP endpoint: "+http("onlyHttp")+"\n"),
                          (http("onlyHttp"),wss("onlyHttp")))
 
     def test_key_and_http_mismatch_rejected(self):
-        src="API key: NEWKEY\\nHTTP: "+http("DIFFERENT")+"\\n"
+        src="API key: NEWKEY\nHTTP: "+http("DIFFERENT")+"\n"
         with self.assertRaisesRegex(ValueError,"MISMATCH"):
             parseCredentials(src)
 
     def test_source_file_with_http_only_still_matches_created_env(self):
         with tempfile.TemporaryDirectory() as tmp:
             source=Path(tmp)/"newalchemy.txt"
-            source.write_text("API key: NEWKEY\\nHTTP: "+http("NEWKEY")+"\\n")
+            source.write_text("API key: NEWKEY\nHTTP: "+http("NEWKEY")+"\n")
             env=Path(tmp)/"protected.env"
             prepareEnvFile(env,http("NEWKEY"),wss("NEWKEY"))
             self.assertTrue(requireSameNewCredentials(env,source))
