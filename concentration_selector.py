@@ -453,7 +453,10 @@ class ConcentrationSelector(Selector):
                     if (str(exc) in ("RPC_HTTP_400","RPC_HTTP_413",
                                       "RPC_JSONRPC_-32005","RPC_JSONRPC_-32602")
                             and last-nextBlock+1>MIN_SCAN_BLOCKS):
-                        rangeSize=max(MIN_SCAN_BLOCKS,(last-nextBlock+1)//2)
+                        # Reduce to a strict power-of-two bound, never retry
+                        # the same rejected range at a different nominal size.
+                        rangeSize=max(MIN_SCAN_BLOCKS,min(rangeSize//2,
+                            1 << ((last-nextBlock).bit_length()-1)))
                         self.scanRangeByKey[key]=rangeSize
                         self.stats["rangeReductions"]+=1
                         continue
