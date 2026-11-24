@@ -436,9 +436,12 @@ def readSnapshot(directory,now=None,limit=50,staleAfterSeconds=180):
                      "ORDER BY d.seq DESC LIMIT ?",(limit,),view,
                      "selector decisions")
         seen=set()
+        observedPolicies=set()
         for d in decRows:
             sid=d["eventKey"]
             payload=unpack(d.get("data"))
+            if payload.get("policyName"):
+                observedPolicies.add(str(payload["policyName"]))
             token=displayToken(d,payload)
             execution=execById.get(sid)
             rev=revById.get(sid)
@@ -505,6 +508,13 @@ def readSnapshot(directory,now=None,limit=50,staleAfterSeconds=180):
         view["opportunities"].sort(key=lambda x:x["decisionAt"] or x["detectedAt"] or 0,
                                    reverse=True)
 
+        view["inferredSelectorPolicy"]=(
+            next(iter(observedPolicies)) if len(observedPolicies)==1 else
+            "MIXED_INCOMPATIBLE_POLICIES" if len(observedPolicies)>1 else None)
+        expectedPolicy=(view.get("policy") or {}).get("selector",{}).get("name")
+        if expectedPolicy and observedPolicies and expectedPolicy not in observedPolicies:
+            view["warnings"].append(
+                "CAMPAIGN_SELECTOR_MISMATCH: recorded decision policy differs from campaign manifest")
         selectorReady=seMeta.get("selectorReady")
         heartbeat=asDecimal(seMeta.get("selectorHeartbeat"))
         heartAge=(max(0,float(Decimal(str(now))-heartbeat)) if heartbeat is not None else None)

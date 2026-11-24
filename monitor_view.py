@@ -112,19 +112,26 @@ def viewBanner(view,screen):
     timestamp=datetime.fromtimestamp(view["now"],timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     policy=view.get("policy") or {}
     wallet=policy.get("walletPublicAddress") or "NOT CONFIGURED"
-    selector=policy.get("selector",{}).get("name") or view.get("meta",{}).get("selector",{}).get("selectorName") or "UNKNOWN"
+    selector=(policy.get("selector",{}).get("name") or
+              view.get("inferredSelectorPolicy") or
+              view.get("meta",{}).get("selector",{}).get("selectorName") or "UNKNOWN")
+    chainVerified=(view.get("health") or {}).get("selectorChainId")
+    chainConfig=policy.get("chainId")
+    chainLabel=("CHAIN "+str(chainVerified)+" (SELECTOR RPC)" if chainVerified else
+                "CHAIN "+str(chainConfig)+" (CONFIG)" if chainConfig else
+                "CHAIN UNVERIFIED")
     top=line(Text("BLACK SWAN  •  CONCENTRATION CONTROL ROOM",style="bold cyan"),
         "   ",Text("READ ONLY",style="bold green"),"   ",
         Text("SCREEN "+screen.upper(),style="bold white"),"  ",timestamp,"\n")
     top+=idLine("RUN",view.get("directory"))
-    top+=line(Text("CHAIN 4663",style="cyan"),"  |  ",
+    top+=line(Text(chainLabel,style="cyan"),"  |  ",
               Text("SELECTOR "+show(selector),style="bold magenta"),"  |  ",
               Text("MODE "+view.get("mode","UNKNOWN"),style="bold yellow"),
               "  |  ",Text("WALLET ",style="dim"),safeText(wallet),"\n")
     return panel("OPERATOR CONTROL • independent SQLite observer",top,"cyan")
 
 
-def scorecard(view):
+def scorecard(view,width=200):
     policy=view.get("policy") or {}
     limits=policy.get("limits") or {}
     main=policy.get("main") or {}
@@ -148,11 +155,14 @@ def scorecard(view):
         ("CASH P/L",pnl),
         ("UNSETTLED TX",str(counts.get("unsettledTx",0))),
     ]
-    t=Table.grid(expand=True,padding=(0,2))
-    for _ in cells:t.add_column(ratio=1,justify="center",overflow="fold")
-    t.add_row(*[Text(label,style="cyan") for label,_ in cells])
-    t.add_row(*[Text(value,style="bold yellow" if value=="UNMEASURED" else "bold white")
-                for _,value in cells])
+    columns=8 if width>=200 else 4 if width>=110 else 2
+    t=Table.grid(expand=True,padding=(0,1))
+    for _ in range(columns):t.add_column(ratio=1,justify="center",overflow="fold")
+    for start in range(0,len(cells),columns):
+        group=cells[start:start+columns]
+        t.add_row(*[Text(label,style="cyan") for label,_ in group])
+        t.add_row(*[Text(value,style="bold yellow" if value=="UNMEASURED" else "bold white")
+                    for _,value in group])
     return panel("CAMPAIGN SCORECARD • confirmed vs estimated kept separate",t,"bright_cyan")
 
 
@@ -454,11 +464,10 @@ def alertList(view,maxRows=None,offset=0):
 
 
 def statusFooter(view,screen,offset=0):
-    t=Text("1 Overview   2 Decisions   3 Positions & Quotes   4 Trades & Finance   5 Alerts",
+    t=Text("1 Overview   2 Decisions   3 Positions   4 Trades/Finance   5 Alerts\n",
            style="bold cyan")
-    t+=Text("   |   n/p Scroll page   j/k Scroll 3 lines   g Top   q Quit",
-            style="dim")
-    t+=Text("   |   SCROLL "+str(offset)+" lines",style="bright_white")
+    t+=Text("SCROLL "+str(offset)+" lines   •   n/p Page   j/k 3 lines   g Top   q/Ctrl+C Exit",
+            style="bright_white")
     if view.get("warnings"):
         t+=Text("   |   DATA WARNINGS "+str(len(view["warnings"])),style="bold red")
     t+=Text("   |   refresh does not touch execution",style="dim")
@@ -505,12 +514,13 @@ def renderScreen(view,screen="overview",width=180,height=60,offset=0):
         raise ValueError("INVALID_MONITOR_SCREEN")
     width=max(70,int(width));height=max(28,int(height))
     root=Layout(name="root")
+    scoreHeight=4 if width>=200 else 6 if width>=110 else 10
     root.split_column(Layout(name="banner",size=6),
-                      Layout(name="scorecard",size=5),
+                      Layout(name="scorecard",size=scoreHeight),
                       Layout(name="content",ratio=1),
-                      Layout(name="footer",size=1))
+                      Layout(name="footer",size=2))
     root["banner"].update(viewBanner(view,screen))
-    root["scorecard"].update(scorecard(view))
+    root["scorecard"].update(scorecard(view,width=width))
     root["content"].update(ScrollableContent(
         _pageContent(view,screen,width,height),offset))
     root["footer"].update(statusFooter(view,screen,offset))
@@ -519,7 +529,7 @@ def renderScreen(view,screen="overview",width=180,height=60,offset=0):
 
 def renderReport(view,width=220):
     """Unclipped, noninteractive all-pages export; no hidden 'top N' semantics."""
-    return Group(viewBanner(view,"FULL REPORT"),scorecard(view),
+    return Group(viewBanner(view,"FULL REPORT"),scorecard(view,width=width),
                  healthCard(view),policyCard(view),
                  decisionList(view),sacrificeList(view),positionList(view),
                  financeCard(view),receiptList(view),saleList(view),
