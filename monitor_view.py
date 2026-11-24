@@ -205,7 +205,7 @@ def decisionList(view,maxRows=None,offset=0):
                            "red" if row.get("status") in ("FAIL","UNKNOWN") else "green" if row.get("status")=="PASS" else "yellow"))
     if not cards:
         cards=[Text("No concentration decisions yet. Detector/selector can be waiting for a first-trade window.",style="yellow")]
-    return panel(f"CONCENTRATION OPPORTUNITIES • {offset+1 if shown else 0}–{offset+len(shown)} of {count}",
+    return panel(f"CONCENTRATION DECISIONS / OPPORTUNITIES • {offset+1 if shown else 0}–{offset+len(shown)} of {count}",
                  Group(*cards),"magenta")
 
 
@@ -322,7 +322,7 @@ def financeCard(view):
     a+=words("Complete reconciliation",f.get("cashComplete"))
     a+=words("Nominal cap (excluding gas)",
              "£"+str((p.get("limits") or {}).get("maxNominalSpendGbp") or "UNKNOWN"))
-    a+=Text("Only receipt-reconciled cashflows count. Unmeasured native payouts, missing FX and open holdings are not profit.",
+    a+=Text("Only receipt-reconciled cashflows count. UNMEASURED native payouts, missing FX and open holdings are not profit.",
             style="dim italic")
     return panel("CONFIRMED FINANCES • NOT PAPER PEAKS",a,"green")
 

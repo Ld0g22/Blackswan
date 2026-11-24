@@ -121,7 +121,7 @@ def readSnapshot(directory,now=None,limit=50,staleAfterSeconds=180):
         now=now,directory=str(directory),base=legacy,
         warnings=list(legacy.get("warnings",[])),policy={},
         mode="SHADOW",hasCampaign=False,hasExecution=False,
-        opportunities=[],holdings=[],sacrifices=[],transactions=[],
+        opportunities=[],positions=[],holdings=[],sacrifices=[],transactions=[],
         sales=[],manualRequests=[],manualFills=[],alerts=[],
         health={},finance={},meta={},counts={},
         sampleLimit=limit,staleAfterSeconds=staleAfterSeconds

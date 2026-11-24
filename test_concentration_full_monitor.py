@@ -169,7 +169,9 @@ class MonitorSnapshotTests(unittest.TestCase):
             self.assertEqual((p/"execution.sqlite3").read_bytes(),b"not sqlite")
 
 
-class MonitorViewTests(MonitorSnapshotTests):
+class MonitorViewTests(unittest.TestCase):
+    setUp=MonitorSnapshotTests.setUp
+    tearDown=MonitorSnapshotTests.tearDown
     def draw(self,view,screen,width=220,height=70):
         stream=io.StringIO()
         c=Console(file=stream,force_terminal=False,color_system=None,
