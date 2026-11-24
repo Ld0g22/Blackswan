@@ -12,12 +12,35 @@ from pathlib import Path
 
 from rich import box
 from rich.console import Group
+from rich.segment import Segment
 from rich.layout import Layout
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
 PAGES=("overview","decisions","positions","ledger","alerts")
+
+
+class ScrollableContent:
+    """Retain every field and scroll all rendered lines; never ellipsize lower
+    position/exits just because a single position exceeds screen height."""
+    def __init__(self,content,offset=0):
+        self.content=content
+        self.offset=max(0,int(offset))
+
+    def __rich_console__(self,console,options):
+        # Layout gives us its assigned viewport height. Remove that limit
+        # while rendering the inner panels, then apply explicit line scrolling.
+        allLines=console.render_lines(
+            self.content,options.update(height=None),pad=False)
+        height=options.height or options.max_height or 30
+        start=min(self.offset,max(0,len(allLines)-height))
+        for lineParts in allLines[start:start+height]:
+            yield from lineParts
+            yield Segment.line()
+        for _ in range(max(0,height-(len(allLines)-start))):
+            yield Segment.line()
+
 DASH="—"
 
 
@@ -430,18 +453,21 @@ def alertList(view,maxRows=None,offset=0):
                  Group(*a),"red" if alerts else "green")
 
 
-def statusFooter(view,screen):
-    t=Text("1 Overview    2 Decisions    3 Positions & Quotes    4 Trades & Finance    5 Alerts",
+def statusFooter(view,screen,offset=0):
+    t=Text("1 Overview   2 Decisions   3 Positions & Quotes   4 Trades & Finance   5 Alerts",
            style="bold cyan")
-    t+=Text("   |   n/p Next/previous   q Quit   Ctrl+C Quit",style="dim")
+    t+=Text("   |   n/p Scroll page   j/k Scroll 3 lines   g Top   q Quit",
+            style="dim")
+    t+=Text("   |   SCROLL "+str(offset)+" lines",style="bright_white")
     if view.get("warnings"):
         t+=Text("   |   DATA WARNINGS "+str(len(view["warnings"])),style="bold red")
     t+=Text("   |   refresh does not touch execution",style="dim")
     return t
 
 
-def _pageContent(view,screen,width,height,offset):
-    perPage=max(1,min(12,(height-17)//10))
+def _pageContent(view,screen,width,height):
+    """All data on each detail screen stays accessible by line scrolling."""
+    maxRows=view.get("sampleLimit",120)
     if screen=="overview":
         left=Group(healthCard(view),decisionList(view,maxRows=1))
         right=Group(policyCard(view),sacrificeList(view,maxRows=1),
@@ -456,21 +482,22 @@ def _pageContent(view,screen,width,height,offset):
                      sacrificeList(view,maxRows=1),positionList(view,maxRows=1),
                      alertList(view,maxRows=1))
     if screen=="decisions":
-        return Group(healthCard(view),decisionList(view,maxRows=perPage,offset=offset))
+        return Group(healthCard(view),decisionList(view,maxRows=maxRows))
     if screen=="positions":
-        return Group(sacrificeList(view,maxRows=max(1,perPage//2),offset=offset),
-                     positionList(view,maxRows=max(1,perPage//2),offset=offset))
+        return Group(sacrificeList(view,maxRows=maxRows),
+                     positionList(view,maxRows=maxRows))
     if screen=="ledger":
-        return Group(financeCard(view),sacrificeList(view,maxRows=perPage,offset=offset),
-                     receiptList(view,maxRows=perPage,offset=offset),
-                     saleList(view,maxRows=perPage,offset=offset),
+        return Group(financeCard(view),sacrificeList(view,maxRows=maxRows),
+                     receiptList(view,maxRows=maxRows),
+                     saleList(view,maxRows=maxRows),
                      panel("MANUAL EXIT REQUESTS",
                            Group(*[words(show(r.get("operation")),
                                       show(r.get("status"))+" / "+show(r.get("reason"))+
                                       " / "+show(r.get("txHash")))
                                    for r in view.get("manualRequests",[])])
                            if view.get("manualRequests") else Text("No manual requests recorded")))
-    return Group(healthCard(view),alertList(view,maxRows=max(1,perPage*2),offset=offset))
+    return Group(healthCard(view),alertList(view,maxRows=maxRows))
+
 
 
 def renderScreen(view,screen="overview",width=180,height=60,offset=0):
@@ -484,8 +511,9 @@ def renderScreen(view,screen="overview",width=180,height=60,offset=0):
                       Layout(name="footer",size=1))
     root["banner"].update(viewBanner(view,screen))
     root["scorecard"].update(scorecard(view))
-    root["content"].update(_pageContent(view,screen,width,height,offset))
-    root["footer"].update(statusFooter(view,screen))
+    root["content"].update(ScrollableContent(
+        _pageContent(view,screen,width,height),offset))
+    root["footer"].update(statusFooter(view,screen,offset))
     return root
 
 

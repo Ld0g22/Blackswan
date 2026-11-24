@@ -177,11 +177,20 @@ def run(argv=None):
                             screen=PAGES[int(key)-1]
                             offset=0
                             break
-                        if key in ("n","j"):
-                            offset+=max(1,(console.height-17)//10)
+                        if key=="g":
+                            offset=0
                             break
-                        if key in ("p","k"):
-                            offset=max(0,offset-max(1,(console.height-17)//10))
+                        if key=="n":
+                            offset+=max(1,console.height-15)
+                            break
+                        if key=="p":
+                            offset=max(0,offset-max(1,console.height-15))
+                            break
+                        if key=="j":
+                            offset+=3
+                            break
+                        if key=="k":
+                            offset=max(0,offset-3)
                             break
                         time.sleep(min(.06,max(0,end-time.monotonic())))
         except KeyboardInterrupt:
