@@ -75,6 +75,15 @@ class ConfiguredFullPipelineTests(unittest.IsolatedAsyncioTestCase):
             "UPDATE transactions SET state='CONFIRMED',receipt=? WHERE selectionId=? AND kind=?",
             (json.dumps(data),self.sid,kind))
 
+    async def test_configured_sacrifice_deadline_applies_after_quote_before_signing(self):
+        self.store.sacrificeDeadlineSeconds=10
+        self.store.db.execute(
+            "UPDATE selections SET decisionAt=? WHERE selectionId=?",
+            (time.time()-5,self.sid))
+        await self.engine.lamb.start(self.selection())
+        self.assertEqual(self.selection()["status"],"PROBE_PENDING")
+        self.assertEqual(len(self.tx.orders),1)
+
     async def test_temporary_rpc_429_during_sacrifice_can_recover_within_deadline(self):
         old=self.routes.verifiedBuyCandidates
         async def unavailable(token,amount):
