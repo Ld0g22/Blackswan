@@ -33,6 +33,7 @@ SILENT_POOL_TIMESLICE_SECONDS = 5
 SILENT_POOL_YIELD_SECONDS = 15
 MAX_RPC_CONCURRENCY = 2
 MAX_ACTIONABLE_DECISION_LAG_SECONDS = 15
+MAX_POST_PASS_AUDITS_PER_CYCLE = 12
 
 
 def concentrationDecision(swaps, firstTradeAt, windowSeconds=30, thresholdBps=2500):
@@ -130,6 +131,7 @@ class ConcentrationSelector(Selector):
         self.session = None
         self.httpGate = asyncio.Semaphore(MAX_RPC_CONCURRENCY)
         self.lastAudit = 0.0
+        self.auditTask = None
         self.stats = Counter()
         self.validatedCheckpoints = set()
         self.headLock = asyncio.Lock()
@@ -450,16 +452,33 @@ class ConcentrationSelector(Selector):
             "SELECT a.eventKey,a.lastBlock,a.lastHash FROM concentration_audits a "
             "JOIN decisions d ON a.eventKey=d.eventKey "
             "WHERE d.status='PASS' AND d.decisionAt >= ? AND NOT EXISTS "
-            "(SELECT 1 FROM revocations r WHERE r.eventKey=a.eventKey)",
-            (time.time()-180,)
+            "(SELECT 1 FROM revocations r WHERE r.eventKey=a.eventKey) "
+            "ORDER BY a.lastChecked,a.eventKey LIMIT ?",
+            (time.time()-180,MAX_POST_PASS_AUDITS_PER_CYCLE)
             ).fetchall()
-        for row in rows[:100]:
+        for row in rows:
             try:
                 current,_=await self._header(row["lastBlock"])
                 if current!=row["lastHash"]:
                     self.revokeOnce(row["eventKey"],"POST_DECISION_CHAIN_REORG")
             except (ValueError,RuntimeError,TypeError,KeyError):
                 self.stats["auditUnknown"]+=1
+            finally:
+                # Rotate through recent PASSes rather than repeatedly auditing
+                # the first N while later decisions never receive a check.
+                self.store.db.execute(
+                    "UPDATE concentration_audits SET lastChecked=? WHERE eventKey=?",
+                    (time.time(),row["eventKey"]))
+
+    def scheduleAuditIfIdle(self,now):
+        """Bound reorg audit concurrency even during slow/429 provider responses."""
+        if now-self.lastAudit<=10:
+            return False
+        if self.auditTask is not None and not self.auditTask.done():
+            return False
+        self.lastAudit=now
+        self.auditTask=self.spawn(self.auditFinal())
+        return True
 
     async def observe(self,cand):
         """Attempt subscription before sequential overlap-proof backfill."""
@@ -601,9 +620,7 @@ class ConcentrationSelector(Selector):
                         self.store.db.execute(
                             "UPDATE meta SET value=? WHERE key='selectorHeartbeat'",
                             (str(time.time()),))
-                    if time.monotonic()-self.lastAudit>10:
-                        self.lastAudit=time.monotonic()
-                        self.spawn(self.auditFinal())
+                    self.scheduleAuditIfIdle(time.monotonic())
                     if time.monotonic()-reportAt>15:
                         reportAt=time.monotonic()
                         print("CONCENTRATION HEALTH",json.dumps({
