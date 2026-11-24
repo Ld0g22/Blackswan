@@ -161,7 +161,12 @@ def policyCard(view):
     wait=s.get("wait") or {}
     a+=words("Survival wait",f"{show(wait.get('value'))} {show(wait.get('unit'))}")
     a+=words("Sacrifice / main deadlines",f"{show(execution.get('sacrificeDeadlineSeconds'))}s / {show(execution.get('entryDeadlineSeconds'))}s")
-    a+=words("Concentration",f"{show(selector.get('windowSeconds'))}s first trade | ≤{(selector.get('maxLargestBuyTransactionShareBps') or 0)/100:g}% largest tx")
+    if selector.get("name")=="concentration":
+        a+=words("Concentration",f"{show(selector.get('windowSeconds'))}s first trade | ≤{selector.get('maxLargestBuyTransactionShareBps',0)/100:g}% largest tx")
+    elif selector.get("name")=="buyingBlocks":
+        a+=words("Buying-block policy",f"{show(selector.get('decisionSeconds'))}s | maximum buying blocks {show(selector.get('maxBuyingBlocks'))}")
+    else:
+        a+=words("Selector policy","NO VALIDATED SELECTOR CONFIG")
     a+=words("Exits"," | ".join(str(e.get("percent"))+"% @ "+str(e.get("multiple"))+"×"
                                for e in p.get("exits",[])) or DASH)
     a+=words("Nominal cap",f"£{show(limits.get('maxNominalSpendGbp'))} (GAS EXCLUDED)")

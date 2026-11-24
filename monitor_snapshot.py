@@ -484,6 +484,15 @@ def readSnapshot(directory,now=None,limit=50,staleAfterSeconds=180):
                                       message="Selector heartbeat stale; verify process before arming",
                                       at=None,token=None,txHash=None))
         for row in view["opportunities"]:
+            executionState=str(row.get("executionStatus") or "")
+            executionReason=str(row.get("executionReason") or "")
+            if (executionState in ("PROBE_FAILED","PROBE_UNKNOWN","PROBE_UNVERIFIED",
+                                  "BUY_UNVERIFIED","SKIPPED","SKIPPED_UNSUPPORTED","REVOKED")
+                    or "MISSED_" in executionReason or "DEADLINE" in executionReason):
+                level="CRITICAL" if "MISSED_" in executionReason or "UNVERIFIED" in executionState else "WARNING"
+                view["alerts"].append(dict(level=level,source="EXECUTION",
+                    message=executionState+": "+(executionReason or row["whyNotBought"]),
+                    at=row["decisionAt"],token=row["token"],txHash=None))
             if row["status"]=="UNKNOWN" or row["revokeReason"]:
                 view["alerts"].append(dict(level="WARNING",source="SELECTOR",
                     message=row["whyNotBought"],at=row["decisionAt"],

@@ -47,6 +47,16 @@ def chooseRunDirectory(runDir,latestBase):
     return max(choices,key=lambda p:p.stat().st_mtime)
 
 
+def nextNewRun(dataDir,seen):
+    """Detect the first NEW configured campaign without touching existing runs."""
+    base=Path(dataDir).expanduser().resolve()
+    if not base.is_dir():
+        return None
+    matches=[p.resolve() for p in base.glob("configured_v3_*")
+             if p.is_dir() and p.resolve() not in seen]
+    return min(matches,key=lambda p:(p.stat().st_mtime,p.name)) if matches else None
+
+
 @contextmanager
 def keyboard():
     """Enable one-key page navigation without changing exit behavior."""
@@ -76,6 +86,7 @@ def parseArgs(argv=None):
     location=parser.add_mutually_exclusive_group(required=True)
     location.add_argument("--run-dir",type=Path,help="Exact data/configured_v3_* or concentration_shadow_* run directory")
     location.add_argument("--latest",action="store_true",help="Pick newest configured or concentration shadow run; displays full chosen path")
+    location.add_argument("--follow-new",action="store_true",help="Start monitor BEFORE arming; attach to the next NEW configured_v3_* campaign")
     parser.add_argument("--data-dir",type=Path,default=Path("data"))
     parser.add_argument("--view",choices=PAGES,default="overview")
     parser.add_argument("--interval",type=float,default=.5,help="Refresh period seconds (0.25–30, default 0.5)")
@@ -83,6 +94,8 @@ def parseArgs(argv=None):
     parser.add_argument("--stale-after",type=int,default=180,help="Quote staleness threshold in seconds")
     parser.add_argument("--once",action="store_true",help="Print a COMPLETE static report and exit; no TTY required")
     args=parser.parse_args(argv)
+    if args.once and args.follow_new:
+        parser.error("--follow-new needs an interactive screen, not --once")
     if not .25<=args.interval<=30:
         parser.error("--interval must be between 0.25 and 30")
     if not 1<=args.rows<=500:
@@ -94,8 +107,12 @@ def parseArgs(argv=None):
 
 def run(argv=None):
     args=parseArgs(argv)
+    waiting=args.follow_new
+    followBase=args.data_dir.expanduser().resolve()
+    seen={p.resolve() for p in followBase.glob("configured_v3_*") if p.is_dir()}
     try:
-        directory=chooseRunDirectory(args.run_dir,args.data_dir if args.latest else None)
+        directory=(followBase if waiting else
+                   chooseRunDirectory(args.run_dir,args.data_dir if args.latest else None))
     except ValueError as exc:
         raise SystemExit(str(exc)) from None
     console=Console(highlight=False)
@@ -117,7 +134,17 @@ def run(argv=None):
                 while True:
                     t0=time.monotonic()
                     try:
+                        if waiting:
+                            newRun=nextNewRun(followBase,seen)
+                            if newRun is not None:
+                                directory=newRun
+                                waiting=False
+                                lastGood=None
+                                offset=0
                         view=readSnapshot(directory,**kwargs)
+                        if waiting:
+                            view["mode"]="WAITING_FOR_NEW_CAMPAIGN"
+                            view["warnings"].append("MONITOR ARMED FOR OBSERVATION ONLY: awaiting a fresh configured_v3_* folder")
                         # A partially read journal must never look like a clean
                         # empty campaign. Keep prior data and visibly mark stale.
                         trouble=[w for w in view["warnings"]
