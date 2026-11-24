@@ -91,6 +91,20 @@ class ConcentrationSelector(Selector):
         self.windowSeconds = windowSeconds
         self.thresholdBps = thresholdBps
         self.firstTradeTimeoutSeconds = firstTradeTimeoutSeconds
+        # Reject old or unrelated selector DBs BEFORE opening them writable.
+        existingPath = Path(dbPath)
+        if existingPath.is_file():
+            try:
+                with sqlite3.connect(
+                    f"file:{existingPath.resolve()}?mode=ro",uri=True,timeout=2
+                ) as previous:
+                    identified = previous.execute(
+                        "SELECT value FROM meta WHERE key='concentrationPolicyHash'"
+                    ).fetchone()
+                if identified is None:
+                    raise RuntimeError("CONCENTRATION_POLICY_OR_DATABASE_MISMATCH")
+            except sqlite3.Error as exc:
+                raise RuntimeError("CONCENTRATION_SELECTOR_DB_UNREADABLE") from exc
         self.store = SelectorStore(dbPath)
         self.detectorPath = Path(detectorPath).resolve()
         self.detector = sqlite3.connect(
@@ -112,6 +126,9 @@ class ConcentrationSelector(Selector):
         self.lastAudit = 0.0
         self.stats = Counter()
         self.validatedCheckpoints = set()
+        self.headLock = asyncio.Lock()
+        self.headAt = 0.0
+        self.cachedHead = None
 
         policy = json.dumps({
             "kind":"concentration","version":POLICY_VERSION,
@@ -211,6 +228,19 @@ class ConcentrationSelector(Selector):
                         self.store.create(event,venue,toTimestamp(event["observedAtUtc"]))
             self.store.advance(row["seq"])
 
+    async def head(self):
+        """A single shared provider-head query for all active launch pools."""
+        now=time.monotonic()
+        if self.cachedHead is not None and now-self.headAt<0.35:
+            return self.cachedHead
+        async with self.headLock:
+            now=time.monotonic()
+            if self.cachedHead is None or now-self.headAt>=0.35:
+                self.cachedHead=int(await self.rpc(
+                    "eth_blockNumber",[],timeout=4),16)
+                self.headAt=time.monotonic()
+            return self.cachedHead
+
     async def _header(self,number):
         result=await self.rpc("eth_getBlockByNumber",[hex(number),False],timeout=4)
         if (not isinstance(result,dict)
@@ -306,7 +336,7 @@ class ConcentrationSelector(Selector):
             self.validatedCheckpoints.add(key)
         state=self.store.db.execute(
             "SELECT * FROM concentration_progress WHERE eventKey=?",(key,)).fetchone()
-        head=int(await self.rpc("eth_blockNumber",[],timeout=4),16)
+        head=await self.head()
         nextBlock=state["nextBlock"]
         if head>=nextBlock:
             last=min(head,nextBlock+9)
@@ -369,6 +399,13 @@ class ConcentrationSelector(Selector):
                         reason="NO_FIRST_TRADE_WITHIN_OBSERVATION_BUDGET",
                         coverageComplete=True,firstTradeAt=None,evidenceErrors=[]))
             return
+        if first["blockTimestamp"]>launchAt+self.firstTradeTimeoutSeconds:
+            if await self.validateChunks(key):
+                self.finish(key,"UNKNOWN",dict(
+                    reason="FIRST_TRADE_AFTER_OBSERVATION_BUDGET",
+                    coverageComplete=True,firstTradeAt=first["blockTimestamp"],
+                    evidenceErrors=[]))
+            return
         cutoff=first["blockTimestamp"]+self.windowSeconds
         if lastChunk["endTimestamp"]<cutoff:
             # A delayed or stalled provider must not cause a false PASS.
@@ -392,8 +429,9 @@ class ConcentrationSelector(Selector):
         rows=self.store.db.execute(
             "SELECT a.eventKey,a.lastBlock,a.lastHash FROM concentration_audits a "
             "JOIN decisions d ON a.eventKey=d.eventKey "
-            "WHERE d.status='PASS' AND NOT EXISTS "
-            "(SELECT 1 FROM revocations r WHERE r.eventKey=a.eventKey)"
+            "WHERE d.status='PASS' AND d.decisionAt >= ? AND NOT EXISTS "
+            "(SELECT 1 FROM revocations r WHERE r.eventKey=a.eventKey)",
+            (time.time()-180,)
             ).fetchall()
         for row in rows[:100]:
             try:
@@ -406,13 +444,32 @@ class ConcentrationSelector(Selector):
     async def observe(self,cand):
         """Attempt subscription before sequential overlap-proof backfill."""
         subscribed=self.spawn(self.subscribe(cand))
+        lastSubscriptionAttempt=time.monotonic()
         await asyncio.sleep(0)
         try:
             while not self.stopping.is_set():
-                if self.store.db.execute(
-                    "SELECT state FROM launches WHERE eventKey=?",
-                    (cand.eventKey,)).fetchone()[0]!="PENDING":
+                launch=self.store.db.execute(
+                    "SELECT state,detectedAt FROM launches WHERE eventKey=?",
+                    (cand.eventKey,)).fetchone()
+                if launch is None or launch["state"]!="PENDING":
                     return
+                # Stalled chain/RPC evidence must become an explicit UNKNOWN,
+                # never a silent, indefinitely waiting opportunity.
+                if time.time()-float(launch["detectedAt"]) > (
+                        self.firstTradeTimeoutSeconds + self.windowSeconds +
+                        MAX_SEAL_DELAY_SECONDS):
+                    state=self.store.db.execute(
+                        "SELECT lastError FROM concentration_progress WHERE eventKey=?",
+                        (cand.eventKey,)).fetchone()
+                    self.finish(cand.eventKey,"UNKNOWN",dict(
+                        reason="OBSERVATION_COVERAGE_TIMEOUT",
+                        coverageComplete=False,
+                        evidenceErrors=[str(state[0])[:90]] if state and state[0] else []))
+                    return
+                if (cand.subId is None and subscribed.done()
+                        and time.monotonic()-lastSubscriptionAttempt>1.0):
+                    subscribed=self.spawn(self.subscribe(cand))
+                    lastSubscriptionAttempt=time.monotonic()
                 try:
                     async with self.httpGate:
                         await self.scanOnce(cand.eventKey)
@@ -496,6 +553,7 @@ def main():
     if not args.detector_db or not args.detector_db.is_file():
         parser.error("DETECTOR_JOURNAL_MISSING")
     import fcntl
+    args.db.parent.mkdir(parents=True,exist_ok=True)
     lock=args.db.with_suffix(".lock").open("a+")
     try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
     except BlockingIOError:
