@@ -2,7 +2,7 @@ name: Build Three — sacrifice and campaign contract
 
 on:
   push:
-    branches: [build/three-configurable-sacrifice-20261123, concentration/build-one]
+    branches: [build/three-configurable-sacrifice-20261123, concentration/build-one, audit/concentration-live-readiness-20261124]
   pull_request:
 
 jobs:
