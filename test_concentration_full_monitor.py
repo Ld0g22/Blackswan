@@ -20,7 +20,7 @@ from test_detector import logTemplate
 
 from monitor_snapshot import readSnapshot
 from monitor_view import renderScreen,renderReport
-from concentration_monitor import chooseRunDirectory
+from concentration_monitor import chooseRunDirectory,nextNewRun
 
 from rich.console import Console
 
@@ -154,6 +154,25 @@ class MonitorSnapshotTests(unittest.TestCase):
         self.assertEqual(view["holdings"][0]["exitSlices"][0]["state"],"UNVERIFIED")
         self.assertTrue(any("sale" in x.lower() for x in view["warnings"]))
 
+    def test_missed_lamb_deadline_surfaces_as_high_priority_alert(self):
+        self.exe.db.execute(
+            "UPDATE selections SET status='PROBE_FAILED',reason='MISSED_1P_DEADLINE' WHERE selectionId=?",
+            (self.key,))
+        result=readSnapshot(self.root)
+        self.assertTrue(any("MISSED_1P_DEADLINE" in item["message"]
+                            for item in result["alerts"]))
+        self.assertEqual(result["opportunities"][0]["executionStatus"],"PROBE_FAILED")
+
+    def test_buying_blocks_config_renders_its_policy_not_fake_concentration(self):
+        self.cfg["selector"]={"name":"buyingBlocks","decisionSeconds":20,"maxBuyingBlocks":10}
+        (self.root/"campaign.json").write_text(json.dumps(self.cfg))
+        output=io.StringIO()
+        Console(file=output,force_terminal=False,width=200).print(
+            renderReport(readSnapshot(self.root),width=200))
+        self.assertIn("buyingBlocks",output.getvalue())
+        self.assertIn("20",output.getvalue())
+        self.assertNotIn("≤0% largest tx",output.getvalue())
+
     def test_reorg_revocation_marks_selected_row(self):
         self.sel.revoke(self.key,"POST_DECISION_CHAIN_REORG")
         row=readSnapshot(self.root)["opportunities"][0]
@@ -212,6 +231,30 @@ class MonitorViewTests(unittest.TestCase):
 
 
 class MonitorCLITests(unittest.TestCase):
+    def test_follow_new_campaign_when_no_directory_exists_yet(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            parent=Path(tmp)/"data"
+            self.assertIsNone(nextNewRun(parent,set()))
+            parent.mkdir()
+            old=parent/"configured_v3_prior"
+            old.mkdir()
+            seen={old.resolve()}
+            self.assertIsNone(nextNewRun(parent,seen))
+            (parent/"concentration_shadow_older").mkdir()
+            self.assertIsNone(nextNewRun(parent,seen))
+            fresh=parent/"configured_v3_new"
+            fresh.mkdir()
+            self.assertEqual(nextNewRun(parent,seen),fresh.resolve())
+
+    def test_monitor_has_follow_new_option_but_no_wallet_or_trade_options(self):
+        script=Path(__file__).with_name("concentration_monitor.py")
+        proc=subprocess.run([sys.executable,str(script),"--help"],
+            capture_output=True,text=True,timeout=10)
+        self.assertEqual(proc.returncode,0,proc.stderr)
+        self.assertIn("--follow-new",proc.stdout)
+        self.assertNotIn("--wallet-file",proc.stdout)
+        self.assertNotIn("--arm-live",proc.stdout)
+
     def test_explicit_folder_and_absent_folder(self):
         with tempfile.TemporaryDirectory() as tmp:
             folder=Path(tmp)
