@@ -16,7 +16,7 @@ import subprocess
 import threading
 import time
 
-from campaign_v3 import defaultCampaign, validateCampaign, campaignDigest
+from campaign_v3 import defaultCampaign, concentrationCampaign, validateCampaign, campaignDigest
 from run_fresh_peaks import (validateWalletFile, detectorReady, startWorker, drain,
                              stopWorkers, newExperimentId, readLines)
 from campaign_config import otherLiveExecutors
@@ -204,6 +204,7 @@ def main():
     parser.add_argument("command",choices=("template","start","resume","status"))
     parser.add_argument("--config",type=Path)
     parser.add_argument("--wallet-address")
+    parser.add_argument("--selector",choices=("buyingBlocks","concentration"),default="buyingBlocks",help="New campaign template selector only")
     parser.add_argument("--arm-live",action="store_true")
     parser.add_argument("--run-dir",type=Path)
     parser.add_argument("--env",type=Path,default=Path.home()/"blackswanRH_guarded/.env")
@@ -214,7 +215,8 @@ def main():
         if args.command=="template":
             if args.config is None or args.wallet_address is None:
                 parser.error("template requires --config and --wallet-address")
-            config=validateCampaign(defaultCampaign(args.wallet_address))
+            config=(concentrationCampaign(args.wallet_address) if args.selector=="concentration"
+                    else validateCampaign(defaultCampaign(args.wallet_address)))
             if args.config.exists():
                 parser.error("Refusing to overwrite existing campaign config")
             args.config.parent.mkdir(parents=True,exist_ok=True)
@@ -237,6 +239,8 @@ def main():
                                   "workerState":meta.get("workerState"),
                                   "version":meta.get("campaignVersion")},indent=2))
             return
+        if args.selector!="buyingBlocks":
+            parser.error("--selector is for template generation; campaign start/resume reads the frozen config")
         startOrResume(args,Path(__file__).resolve().parent)
     except (ValueError,RuntimeError,OSError,KeyError,json.JSONDecodeError,sqlite3.Error) as exc:
         parser.error(str(exc))
