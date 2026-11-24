@@ -48,6 +48,20 @@ class ConfiguredLauncherTests(unittest.TestCase):
             self.assertTrue(saved["sacrifice"]["enabled"])
             self.assertEqual(saved["walletPublicAddress"],WALLET)
 
+    def test_concentration_template_is_one_operator_setting_and_preserves_sacrifice(self):
+        script=Path(__file__).with_name("run_configured_campaign.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            output=Path(tmp)/"concentration.json"
+            result=subprocess.run([
+                sys.executable,str(script),"template","--wallet-address",WALLET,
+                "--selector","concentration","--config",str(output)],
+                capture_output=True,text=True,timeout=10)
+            self.assertEqual(result.returncode,0,result.stderr)
+            cfg=validateCampaign(json.loads(output.read_text()))
+            self.assertEqual(cfg["selector"]["name"],"concentration")
+            self.assertEqual(cfg["selector"]["maxLargestBuyTransactionShareBps"],2500)
+            self.assertTrue(cfg["sacrifice"]["enabled"])
+
     def test_start_requires_explicit_arm_without_creating_campaign(self):
         script=Path(__file__).with_name("run_configured_campaign.py")
         with tempfile.TemporaryDirectory() as tmp:
