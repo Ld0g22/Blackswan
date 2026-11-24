@@ -144,7 +144,10 @@ def healthCard(view):
     a+=words("Backlog / revocations",f"{show(h.get('detectorBacklog'))} / {show(h.get('revoked'))}")
     a+=words("Intake / worker",f"{show(h.get('intakeState'))} / {show(h.get('workerState'))}")
     a+=words("Held-venue watcher",f"{show(h.get('watcherState'))} ({show(h.get('watcherError'))})")
-    a+=words("Executor process",h.get("executorProcessLiveness") or "NOT INSTRUMENTED")
+    a+=words("Local PIDs (detector / selector / executor)",
+             f"{show(h.get('detectorPid'))} / {show(h.get('selectorPid'))} / {show(h.get('executorPid'))}")
+    a+=words("Executor process (local)",h.get("executorProcessLiveness") or "NOT INSTRUMENTED")
+    a+=Text("A matching PID is process evidence, NOT a wallet/RPC heartbeat.",style="dim italic")
     return panel("PIPELINE HEALTH • ledger status ≠ process heartbeat",a,"bright_green")
 
 

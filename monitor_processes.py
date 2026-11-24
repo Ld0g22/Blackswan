@@ -16,7 +16,7 @@ def findRunWorkers(directory,procRoot=Path("/proc")):
         return result
     expected={
         "executor":("live_executor.py",directory/"execution.sqlite3"),
-        "selector":("concentration_selector.py",directory/"selector.sqlite3"),
+        "selector":(("concentration_selector.py","five_second_selector.py"),directory/"selector.sqlite3"),
         "detector":("detector.py",directory/"detector.sqlite3")
     }
     found={name:[] for name in expected}
@@ -49,7 +49,9 @@ def findRunWorkers(directory,procRoot=Path("/proc")):
                 continue  # Cannot prove the target's original working dir.
             resolved=path.resolve()
             for name,(script,db) in expected.items():
-                if script in scriptNames and resolved==db:
+                if ((script in scriptNames if isinstance(script,str)
+                     else any(name in scriptNames for name in script))
+                     and resolved==db):
                     found[name].append(int(proc.name))
     except (PermissionError,OSError):
         result["available"]=False

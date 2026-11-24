@@ -14,6 +14,7 @@ import time
 from urllib.parse import quote
 
 from live_dashboard import snapshot as originalSnapshot
+from monitor_processes import findRunWorkers
 
 
 def asInt(value,default=None):
@@ -497,7 +498,18 @@ def readSnapshot(directory,now=None,limit=50,staleAfterSeconds=180):
         heartAge=(max(0,float(Decimal(str(now))-heartbeat)) if heartbeat is not None else None)
         exeIntake=exMeta.get("intakeState")
         retired=exeIntake=="CLOSED" and exMeta.get("workerState")=="RETIRED"
+        workerPids=findRunWorkers(directory)
+        if workerPids["executor"] is not None:
+            executorLive=("RUNNING PID "+str(workerPids["executor"]) if
+                          isinstance(workerPids["executor"],int) else
+                          "MULTIPLE_MATCHING_EXECUTORS")
+        elif not workerPids["available"]:
+            executorLive="PROCESS_VISIBILITY_UNAVAILABLE"
+        else:
+            executorLive="NOT_OBSERVED_ON_THIS_HOST"
         view["health"]=dict(
+            detectorPid=workerPids["detector"],selectorPid=workerPids["selector"],
+            executorPid=workerPids["executor"],processVisibility=workerPids["available"],
             detectorStatus=deMeta.get("status") or legacy.get("detector",{}).get("status"),
             detectorHead=deMeta.get("lastConnectedHead") or legacy.get("detector",{}).get("head"),
             detectorGaps=legacy.get("detector",{}).get("gaps"),
@@ -518,10 +530,21 @@ def readSnapshot(directory,now=None,limit=50,staleAfterSeconds=180):
             workerState=exMeta.get("workerState"),
             watcherState=exMeta.get("venueWatchState"),
             watcherError=exMeta.get("venueWatchError"),
-            executorProcessLiveness="NOT_INSTRUMENTED_BY_LEDGER",
+            executorProcessLiveness=executorLive,
             sourceRetired=retired
         )
 
+        # A matching PID is only local evidence of a running process, NOT a
+        # chain heartbeat or proof that the worker is making progress.
+        if ex is not None and workerPids["available"] and not retired:
+            if workerPids["executor"] is None:
+                view["alerts"].append(dict(level="WARNING",source="EXECUTOR",
+                    message="No exact campaign executor PID observed on this host; verify process",
+                    at=None,token=None,txHash=None))
+            elif workerPids["executor"]=="MULTIPLE_MATCHING_PIDS":
+                view["alerts"].append(dict(level="CRITICAL",source="EXECUTOR",
+                    message="Multiple exact matching executor PIDs! Verify only one is running",
+                    at=None,token=None,txHash=None))
         # Alerts are derived from evidence; they do not imply a live process.
         if se is not None and selectorReady=="1" and heartAge is not None and heartAge>15 and not retired:
             view["alerts"].append(dict(level="CRITICAL",source="SELECTOR",
