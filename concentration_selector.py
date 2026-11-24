@@ -28,10 +28,15 @@ DEFAULT_WINDOW = 30
 DEFAULT_SHARE_BPS = 2500
 DEFAULT_FIRST_TRADE_TIMEOUT = 300
 MAX_SEAL_DELAY_SECONDS = 60
-MAX_ACTIVE_CANDIDATES = 12
+MAX_ACTIVE_CANDIDATES = 64
 SILENT_POOL_TIMESLICE_SECONDS = 5
-SILENT_POOL_YIELD_SECONDS = 15
+SILENT_POOL_YIELD_SECONDS = 2
 MAX_RPC_CONCURRENCY = 2
+MAX_SCAN_BLOCKS = 512
+MIN_SCAN_BLOCKS = 10
+SILENT_SCAN_SECONDS = 5.0
+ACTIVE_RETRY_SECONDS = 0.75
+TRADE_HINT_SECONDS = 10.0
 MAX_ACTIONABLE_DECISION_LAG_SECONDS = 15
 MAX_POST_PASS_AUDITS_PER_CYCLE = 12
 
@@ -130,6 +135,13 @@ class ConcentrationSelector(Selector):
         self.stopping = asyncio.Event()
         self.session = None
         self.httpGate = asyncio.Semaphore(MAX_RPC_CONCURRENCY)
+        # Silent scans and background audits share ONE slot. A traded pool
+        # can always contend for the other slot; network waits remain bounded.
+        self.silentGate = asyncio.Semaphore(1)
+        self.rpcPauseUntil = 0.0
+        self.rpcFailureStreak = 0
+        self.rpcErrors = Counter()
+        self.scanRangeByKey = {}
         self.lastAudit = 0.0
         self.auditTask = None
         self.stats = Counter()
@@ -188,6 +200,71 @@ class ConcentrationSelector(Selector):
           lastHash TEXT NOT NULL,lastChecked REAL NOT NULL);
         """)
 
+    def pauseRpc(self,retryAfter=None):
+        self.rpcFailureStreak=min(6,self.rpcFailureStreak+1)
+        delay=min(16.0,0.5*2**self.rpcFailureStreak)
+        try:
+            delay=max(delay,float(retryAfter))
+        except (TypeError,ValueError,OverflowError):
+            pass
+        self.rpcPauseUntil=max(self.rpcPauseUntil,time.monotonic()+delay)
+
+    async def rpc(self,method,params,timeout=4):
+        """Preserve exact status/code without logging URL, credentials or body."""
+        if time.monotonic()<self.rpcPauseUntil:
+            raise RuntimeError("RPC_BACKOFF_ACTIVE")
+        self.requestId+=1
+        self.rpcCounts[method]+=1
+        try:
+            async with self.session.post(self.httpUrl,
+                    json={"jsonrpc":"2.0","id":self.requestId,"method":method,"params":params},
+                    timeout=aiohttp.ClientTimeout(total=timeout)) as response:
+                if response.status!=200:
+                    reason="RPC_HTTP_"+str(response.status)
+                    self.rpcErrors[method+":"+reason]+=1
+                    if response.status==429 or response.status>=500:
+                        self.pauseRpc(response.headers.get("Retry-After"))
+                    raise RuntimeError(reason)
+                data=await response.json()
+        except (aiohttp.ClientError,asyncio.TimeoutError,ValueError) as exc:
+            reason="RPC_TRANSPORT_"+type(exc).__name__
+            self.rpcErrors[method+":"+reason]+=1
+            raise RuntimeError(reason) from None
+        if not isinstance(data,dict) or "error" in data or "result" not in data:
+            error=data.get("error") if isinstance(data,dict) else None
+            code=error.get("code") if isinstance(error,dict) else None
+            reason="RPC_JSONRPC_"+str(code) if type(code) is int else "RPC_INVALID_RESPONSE"
+            self.rpcErrors[method+":"+reason]+=1
+            if code in (429,-32016):
+                self.pauseRpc()
+            raise RuntimeError(reason)
+        if time.monotonic()>=self.rpcPauseUntil:
+            self.rpcFailureStreak=0
+        return data["result"]
+
+    def hasTradeHint(self,cand):
+        return getattr(cand,"tradeHintUntil",0)>time.monotonic()
+
+    def firstTrade(self,key):
+        return self.store.db.execute(
+            "SELECT blockNumber,blockTimestamp FROM concentration_swaps WHERE eventKey=? "
+            "ORDER BY blockNumber,logIndex LIMIT 1",(key,)).fetchone()
+
+    def nextScanDelay(self,cand):
+        first=self.firstTrade(cand.eventKey)
+        if first is not None:
+            cutoff=first["blockTimestamp"]+self.windowSeconds
+            # Once the canonical anchor is known, no incremental RPC is
+            # required until the complete observation window can be sealed.
+            return max(ACTIVE_RETRY_SECONDS,cutoff-self.wallTime())
+        return ACTIVE_RETRY_SECONDS if self.hasTradeHint(cand) else SILENT_SCAN_SECONDS
+
+    async def waitForWake(self,cand,delay):
+        try:
+            await asyncio.wait_for(cand.wake.wait(),timeout=max(.05,delay))
+        except asyncio.TimeoutError:
+            pass
+
     def acceptLog(self,cand,raw,receivedAt,origin):
         """Websocket is a fast hint. Canonical HTTP backfill is decision truth."""
         if not isinstance(raw,dict):
@@ -205,6 +282,15 @@ class ConcentrationSelector(Selector):
                 self.revokeOnce(cand.eventKey,"V4_SWAP_REMOVED")
             if raw.get("removed"):
                 cand.subscriptionInterrupted = True
+                if hasattr(cand,"wake"):
+                    cand.wake.set()
+            elif not getattr(cand,"observedFirstTrade",False):
+                # WS only wakes/prioritises a pool. A notification is never
+                # inserted as canonical evidence or permitted to trigger PASS.
+                cand.tradeHintUntil=time.monotonic()+TRADE_HINT_SECONDS
+                if not hasattr(cand,"wake"):
+                    cand.wake=asyncio.Event()
+                cand.wake.set()
         except (IndexError,AttributeError,TypeError,KeyError):
             cand.errors.append("MALFORMED_WS_SWAP")
 
@@ -316,7 +402,7 @@ class ConcentrationSelector(Selector):
                   "reason",payload.get("reason"),flush=True)
 
     async def scanOnce(self,key):
-        """Fetch at most ten canonical blocks and advance a durable checkpoint."""
+        """Read a bounded canonical range; adapt if the provider rejects its size."""
         launch=self.store.db.execute(
             "SELECT * FROM launches WHERE eventKey=?",(key,)).fetchone()
         if launch is None or launch["state"]!="PENDING":
@@ -353,14 +439,29 @@ class ConcentrationSelector(Selector):
         head=await self.head()
         nextBlock=state["nextBlock"]
         if head>=nextBlock:
-            last=min(head,nextBlock+9)
-            filt={"address":V4_MANAGER,"topics":[V4_SWAP,venue["id"]],
-                  "fromBlock":hex(nextBlock),"toBlock":hex(last)}
-            logs=await self.rpc("eth_getLogs",[filt],timeout=4)
+            rangeSize=self.scanRangeByKey.get(key,MAX_SCAN_BLOCKS)
+            while True:
+                last=min(head,nextBlock+rangeSize-1)
+                filt={"address":V4_MANAGER,"topics":[V4_SWAP,venue["id"]],
+                      "fromBlock":hex(nextBlock),"toBlock":hex(last)}
+                # Fence the getLogs read with canonical boundary hashes,
+                # including EMPTY ranges: a fork cannot silently erase swaps.
+                endHash,endTimestamp=await self._header(last)
+                try:
+                    logs=await self.rpc("eth_getLogs",[filt],timeout=4)
+                except RuntimeError as exc:
+                    if (str(exc) in ("RPC_HTTP_400","RPC_HTTP_413",
+                                      "RPC_JSONRPC_-32005","RPC_JSONRPC_-32602")
+                            and last-nextBlock+1>MIN_SCAN_BLOCKS):
+                        rangeSize=max(MIN_SCAN_BLOCKS,(last-nextBlock+1)//2)
+                        self.scanRangeByKey[key]=rangeSize
+                        self.stats["rangeReductions"]+=1
+                        continue
+                    raise
+                break
             if not isinstance(logs,list):
                 raise RuntimeError("INVALID_RPC_LOGS_RESULT")
-            endHash,endTimestamp=await self._header(last)
-            verified={}
+            verified={last:(endHash,endTimestamp)}
             newRows=[]
             for raw in logs:
                 if raw.get("removed"):
@@ -381,6 +482,9 @@ class ConcentrationSelector(Selector):
                                 decoded["logIndex"],blockTimestamp,
                                 str(decoded["buyBaseAmount"]),
                                 json.dumps(raw,sort_keys=True)))
+            finalHash,finalTimestamp=await self._header(last)
+            if (finalHash,finalTimestamp)!=(endHash,endTimestamp):
+                raise RuntimeError("RANGE_REORG_DURING_GETLOGS")
             self.store.db.execute("BEGIN IMMEDIATE")
             try:
                 for entry in newRows:
@@ -398,9 +502,7 @@ class ConcentrationSelector(Selector):
                 if self.store.db.in_transaction:self.store.db.execute("ROLLBACK")
                 raise
 
-        first=self.store.db.execute(
-            "SELECT blockNumber,blockTimestamp FROM concentration_swaps WHERE eventKey=? "
-            "ORDER BY blockNumber,logIndex LIMIT 1",(key,)).fetchone()
+        first=self.firstTrade(key)
         lastChunk=self.store.db.execute(
             "SELECT endBlock,endHash,endTimestamp FROM concentration_chunks WHERE eventKey=? "
             "ORDER BY endBlock DESC LIMIT 1",(key,)).fetchone()
@@ -458,7 +560,9 @@ class ConcentrationSelector(Selector):
             ).fetchall()
         for row in rows:
             try:
-                current,_=await self._header(row["lastBlock"])
+                async with self.silentGate:
+                    async with self.httpGate:
+                        current,_=await self._header(row["lastBlock"])
                 if current!=row["lastHash"]:
                     self.revokeOnce(row["eventKey"],"POST_DECISION_CHAIN_REORG")
             except (ValueError,RuntimeError,TypeError,KeyError):
@@ -480,48 +584,99 @@ class ConcentrationSelector(Selector):
         self.auditTask=self.spawn(self.auditFinal())
         return True
 
+    def coverageTimeout(self,key):
+        state=self.store.db.execute(
+            "SELECT nextBlock,lastError FROM concentration_progress WHERE eventKey=?",
+            (key,)).fetchone()
+        chunk=self.store.db.execute(
+            "SELECT endBlock,endTimestamp FROM concentration_chunks WHERE eventKey=? "
+            "ORDER BY endBlock DESC LIMIT 1",(key,)).fetchone()
+        first=self.firstTrade(key)
+        errors=([str(state["lastError"])[:90]] if state and state["lastError"] else
+                ["SCHEDULER_NOT_STARTED"] if state is None else
+                ["CANONICAL_COVERAGE_INCOMPLETE"])
+        self.finish(key,"UNKNOWN",dict(reason="OBSERVATION_COVERAGE_TIMEOUT",
+            coverageComplete=False,evidenceErrors=errors,
+            firstTradeAt=first["blockTimestamp"] if first else None,
+            coveredThroughBlock=chunk["endBlock"] if chunk else None,
+            coveredThroughTimestamp=chunk["endTimestamp"] if chunk else None,
+            nextBlock=state["nextBlock"] if state else None))
+
+    def expireUnstarted(self,now):
+        cutoff=now-(self.firstTradeTimeoutSeconds+self.windowSeconds+MAX_SEAL_DELAY_SECONDS)
+        rows=self.store.db.execute(
+            "SELECT eventKey FROM launches WHERE state='PENDING' AND detectedAt<?",
+            (cutoff,)).fetchall()
+        for row in rows:
+            if row["eventKey"] not in self.candidates:
+                self.coverageTimeout(row["eventKey"])
+
     async def observe(self,cand):
-        """Attempt subscription before sequential overlap-proof backfill."""
+        """Canonical scans only when useful, with priority for active trading."""
+        if not hasattr(cand,"wake"):
+            cand.wake=asyncio.Event()
         subscribed=self.spawn(self.subscribe(cand))
         lastSubscriptionAttempt=time.monotonic()
         await asyncio.sleep(0)
         try:
             while not self.stopping.is_set():
+                cand.wake.clear()
                 launch=self.store.db.execute(
                     "SELECT state,detectedAt FROM launches WHERE eventKey=?",
                     (cand.eventKey,)).fetchone()
                 if launch is None or launch["state"]!="PENDING":
                     return
-                # Stalled chain/RPC evidence must become an explicit UNKNOWN,
-                # never a silent, indefinitely waiting opportunity.
                 if time.time()-float(launch["detectedAt"]) > (
-                        self.firstTradeTimeoutSeconds + self.windowSeconds +
-                        MAX_SEAL_DELAY_SECONDS):
-                    state=self.store.db.execute(
-                        "SELECT lastError FROM concentration_progress WHERE eventKey=?",
-                        (cand.eventKey,)).fetchone()
-                    self.finish(cand.eventKey,"UNKNOWN",dict(
-                        reason="OBSERVATION_COVERAGE_TIMEOUT",
-                        coverageComplete=False,
-                        evidenceErrors=[str(state[0])[:90]] if state and state[0] else []))
+                        self.firstTradeTimeoutSeconds+self.windowSeconds+MAX_SEAL_DELAY_SECONDS):
+                    self.coverageTimeout(cand.eventKey)
                     return
-                if (cand.subId is None and subscribed.done()
-                        and time.monotonic()-lastSubscriptionAttempt>1.0):
+                if cand.subId is None and subscribed.done() and time.monotonic()-lastSubscriptionAttempt>3:
                     subscribed=self.spawn(self.subscribe(cand))
                     lastSubscriptionAttempt=time.monotonic()
+                first=self.firstTrade(cand.eventKey)
+                cand.observedFirstTrade=first is not None
+                active=cand.observedFirstTrade or self.hasTradeHint(cand)
+                pause=self.rpcPauseUntil-time.monotonic()
+                if pause>0:
+                    # Do not wake on websocket traffic during provider backoff.
+                    await asyncio.sleep(min(pause,2))
+                    continue
+                if not active and self.silentGate.locked():
+                    # Do not queue a silent task behind many silent pools;
+                    # a new WS hint can immediately promote it to active.
+                    await self.waitForWake(cand,.25)
+                    continue
                 try:
-                    async with self.httpGate:
-                        await self.scanOnce(cand.eventKey)
-                    await asyncio.sleep(0.08)
+                    if active:
+                        async with self.httpGate:
+                            await self.scanOnce(cand.eventKey)
+                    else:
+                        async with self.silentGate:
+                            async with self.httpGate:
+                                await self.scanOnce(cand.eventKey)
+                    state=self.store.db.execute(
+                        "SELECT state FROM launches WHERE eventKey=?",(cand.eventKey,)).fetchone()
+                    if state is None or state["state"]!="PENDING":
+                        return
+                    cand.observedFirstTrade=self.firstTrade(cand.eventKey) is not None
+                    delay=self.nextScanDelay(cand)
+                    if cand.observedFirstTrade:
+                        # Clear normal swap wakeups that arrived during the
+                        # initial anchor scan; canonical scan at window end.
+                        if not cand.subscriptionInterrupted:
+                            cand.wake.clear()
+                    await self.waitForWake(cand,delay)
                 except (RuntimeError,ValueError,KeyError,IndexError,TypeError,
                         aiohttp.ClientError,asyncio.TimeoutError,sqlite3.Error) as exc:
-                    # Partial RPC/ABI evidence can never authorize a PASS.
-                    reason=type(exc).__name__+":"+str(exc)[:90]
+                    reason=(type(exc).__name__+":"+str(exc)[:90]
+                            if isinstance(exc,RuntimeError) else type(exc).__name__)
                     self.stats["retries"]+=1
-                    self.store.db.execute(
-                        "UPDATE concentration_progress SET lastError=? WHERE eventKey=?",
-                        (reason,cand.eventKey))
-                    await asyncio.sleep(0.65)
+                    if str(exc)!="RPC_BACKOFF_ACTIVE":
+                        self.store.db.execute(
+                            "UPDATE concentration_progress SET lastError=? WHERE eventKey=?",
+                            (reason,cand.eventKey))
+                    await asyncio.sleep(max(ACTIVE_RETRY_SECONDS,
+                        min(2,self.rpcPauseUntil-time.monotonic())))
         finally:
             if not subscribed.done():
                 subscribed.cancel()
@@ -529,6 +684,12 @@ class ConcentrationSelector(Selector):
             await self.unsubscribe(cand)
             self.candidates.pop(cand.eventKey,None)
             self.observerTasks.pop(cand.eventKey,None)
+            self.validatedCheckpoints.discard(cand.eventKey)
+            state=self.store.db.execute(
+                "SELECT state FROM launches WHERE eventKey=?",(cand.eventKey,)).fetchone()
+            if state is None or state["state"]!="PENDING":
+                self.scanRangeByKey.pop(cand.eventKey,None)
+                self.deferUntil.pop(cand.eventKey,None)
 
     def pendingToStart(self, limit):
         """Exclude active and temporarily deferred pools BEFORE applying LIMIT."""
@@ -564,7 +725,7 @@ class ConcentrationSelector(Selector):
             hasSwap=self.store.db.execute(
                 "SELECT 1 FROM concentration_swaps WHERE eventKey=? LIMIT 1",
                 (key,)).fetchone()
-            if not hasSwap:
+            if not hasSwap and not self.hasTradeHint(cand):
                 eligible.append((cand.startedAt,key))
         if not eligible:
             return None
@@ -600,6 +761,9 @@ class ConcentrationSelector(Selector):
             try:
                 while not self.stopping.is_set():
                     self.pull()
+                    self.expireUnstarted(time.time())
+                    now=self.rotationClock()
+                    self.deferUntil={key:until for key,until in self.deferUntil.items() if until>now}
                     capacity=MAX_ACTIVE_CANDIDATES-len(self.candidates)
                     if capacity==0:
                         victim=self.chooseSilentPreemption(self.rotationClock())
@@ -623,10 +787,16 @@ class ConcentrationSelector(Selector):
                     self.scheduleAuditIfIdle(time.monotonic())
                     if time.monotonic()-reportAt>15:
                         reportAt=time.monotonic()
+                        self.store.db.execute(
+                            "INSERT INTO meta(key,value) VALUES('concentrationRpcErrors',?) "
+                            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                            (json.dumps(dict(self.rpcErrors),sort_keys=True),))
                         print("CONCENTRATION HEALTH",json.dumps({
                             "decisions":self.store.status(),
                             "active":len(self.candidates),
                             "rpcCalls":dict(self.rpcCounts),
+                            "rpcErrors":dict(self.rpcErrors),
+                            "rpcBackoffSeconds":round(max(0,self.rpcPauseUntil-time.monotonic()),2),
                             "wsMessages":self.wsMessages,
                             "stats":dict(self.stats)}),flush=True)
                     await asyncio.sleep(0.1)
