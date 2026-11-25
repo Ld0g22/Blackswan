@@ -9,6 +9,7 @@ import asyncio
 from collections import Counter
 from datetime import datetime
 import json
+import os
 from pathlib import Path
 import signal
 import sqlite3
@@ -227,7 +228,8 @@ class Selector:
                 if stored != intended:
                     raise RuntimeError('SELECTOR_DECISION_WINDOW_MISMATCH' if key == 'decisionSeconds'
                                        else 'SELECTOR_BUY_BLOCK_POLICY_MISMATCH')
-            expected.update(selectorName='buyingBlocks', selectorReady='0', selectorHeartbeat='0')
+            expected.update(selectorName='buyingBlocks', selectorReady='0', selectorHeartbeat='0',
+                            selectorPid=str(os.getpid()))
             db.executemany('INSERT INTO meta(key,value) VALUES(?,?) '
                            'ON CONFLICT(key) DO UPDATE SET value=excluded.value', expected.items())
             db.execute('COMMIT')
@@ -368,9 +370,11 @@ class Selector:
     def acceptLog(self, cand, raw, receivedAt, origin):
         if cand.closed or cand.deadline is not None and receivedAt > cand.deadline:
             return
-        if not isinstance(raw, dict) or int(raw.get('blockNumber','0x0'),16) < int(cand.event['blockNumber']):
-            return
         try:
+            if not isinstance(raw, dict):
+                raise ValueError('Malformed activity event')
+            if int(raw['blockNumber'],16) < int(cand.event['blockNumber']):
+                return
             filt = activityFilter(cand.venue)
             if raw.get('address','').lower()!=filt['address'].lower():
                 return
@@ -388,7 +392,7 @@ class Selector:
                    else int(decoded['buyBaseAmount'])>0)
             if buy:
                 self.store.observeBuy(cand.eventKey,raw,receivedAt,origin)
-        except (ValueError, TypeError, KeyError):
+        except (ValueError, TypeError, KeyError, AttributeError):
             cand.errors.append('invalidActivityEvent')
 
     async def backfill(self, cand):
@@ -461,7 +465,7 @@ class Selector:
 
     def finish(self, cand, status, reason):
         blocks = self.store.buyingBlocks(cand.eventKey,cand.deadline or time.time())
-        result = {'buyBlockCount':len(blocks),'buyBlockHashes':blocks,
+        result = {'policyName':'buyingBlocks','buyBlockCount':len(blocks),'buyBlockHashes':blocks,
                   'coverageComplete':bool(cand.backfillDone and cand.subscriptionStarted
                                           and not cand.subscriptionInterrupted and not cand.errors),
                   'reason':reason,'headerTimestamp':cand.deadline-getattr(self,'decisionSeconds',SELECTION_SECONDS) if cand.deadline else None,

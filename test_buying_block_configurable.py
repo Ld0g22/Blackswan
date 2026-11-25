@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from campaign_v3 import defaultCampaign, validateCampaign, campaignDigest
-from five_second_selector import Selector, SelectorStore, decisionStatus, eligibleVenues
+from five_second_selector import Selector, SelectorStore, Candidate, decisionStatus, eligibleVenues
 from detector import EventJournal, decodeLog
 from test_detector import logTemplate
 from test_concentration_selector import swap
@@ -99,6 +99,7 @@ class BuyingBlockConfigTests(unittest.TestCase):
                 sel.setReady(True)
                 self.assertTrue(selectorReady(path,"buyingBlocks"))
                 self.assertFalse(selectorReady(path,"buyingBlocks",startedAt=time.time()+1))
+                self.assertFalse(selectorReady(path,"buyingBlocks",expectedPid=-1))
                 self.assertFalse(selectorReady(path,"concentration"))
                 sel.store.db.execute("UPDATE meta SET value=? WHERE key='selectorHeartbeat'",
                                      (str(time.time()-11),))
@@ -160,8 +161,8 @@ class BuyingBlockHandoffTests(unittest.IsolatedAsyncioTestCase):
             sel.rpc=rpc
             sel.subscribe=subscribe
             try:
-                with patch("five_second_selector.time.time",side_effect=lambda:clock[0]), \\
-                     patch("five_second_selector.asyncio.sleep",side_effect=sleep):
+                with (patch("five_second_selector.time.time",side_effect=lambda:clock[0]),
+                      patch("five_second_selector.asyncio.sleep",side_effect=sleep)):
                     sel.pull()
                     self.assertEqual(len(sel.tasks),1)
                     await asyncio.gather(*list(sel.tasks))
@@ -207,6 +208,26 @@ class BuyingBlockHandoffTests(unittest.IsolatedAsyncioTestCase):
     async def test_custom_range_and_incomplete_coverage(self):
         await self.exerciseWindow(45,4,8,"FAIL")
         await self.exerciseWindow(30,3,10,"UNKNOWN",interrupted=True)
+
+    async def test_malformed_activity_never_creates_false_coverage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            detector=root/"detector.sqlite3"
+            with sqlite3.connect(detector): pass
+            sel=Selector(detector,root/"selector.sqlite3","https://unused.invalid","wss://unused.invalid",
+                         decisionSeconds=30,minBuyingBlocks=3,maxBuyingBlocks=10)
+            event=decodeLog(logTemplate("uniswapV4"))
+            venue=eligibleVenues(event)[0]
+            candidate=Candidate("key",event,venue)
+            try:
+                sel.acceptLog(candidate,{"blockNumber":"malformed"},time.time(),"live")
+                sel.acceptLog(candidate,None,time.time(),"live")
+                self.assertEqual(candidate.errors,["invalidActivityEvent","invalidActivityEvent"])
+                self.assertEqual(decisionStatus(3,True,True,False,candidate.errors,
+                                                maxBuyingBlocks=10,minBuyingBlocks=3),"UNKNOWN")
+            finally:
+                sel.detector.close()
+                sel.store.db.close()
 
     async def test_wrong_chain_never_ready(self):
         with tempfile.TemporaryDirectory() as tmp:
