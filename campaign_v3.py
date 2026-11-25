@@ -151,17 +151,25 @@ def validateCampaign(raw: dict) -> dict:
 
     limits = raw["limits"]
     _shape(limits, ("maxSacrifices", "maxNominalSpendGbp"), "LIMITS")
-    maxSacrifices = _integer(limits["maxSacrifices"], "MAX_SACRIFICES", 0, 10000)
-    maxNominal = _decimal(limits["maxNominalSpendGbp"], "MAX_NOMINAL_SPEND", Decimal("0.01"), Decimal("10000"), 2)
-    if Decimal(mainStake) * count > maxNominal:
+    # Explicit JSON null disables the individual limit; finite legacy
+    # manifests retain the same validation and canonical identity.
+    maxSacrifices = (None if limits["maxSacrifices"] is None else
+                     _integer(limits["maxSacrifices"], "MAX_SACRIFICES", 0, 10000))
+    maxNominal = (None if limits["maxNominalSpendGbp"] is None else
+                  _decimal(limits["maxNominalSpendGbp"], "MAX_NOMINAL_SPEND",
+                           Decimal("0.01"), Decimal("10000"), 2))
+    if maxNominal is not None and Decimal(mainStake) * count > maxNominal:
         raise ValueError("NOMINAL_LIMIT_CANNOT_COVER_MAIN_CAMPAIGN")
-    if sacrifice["enabled"] and (maxSacrifices < count or Decimal(mainStake) * count + Decimal(sacrificeStake) > maxNominal):
+    if sacrifice["enabled"] and (
+            (maxSacrifices is not None and maxSacrifices < count)
+            or (maxNominal is not None and
+                Decimal(mainStake) * count + Decimal(sacrificeStake) > maxNominal)):
         raise ValueError("SACRIFICE_CAP_INSUFFICIENT")
     result = deepcopy(raw)
     result["walletPublicAddress"] = wallet.lower()
     result["main"]["stakeGbp"] = mainStake
     result["sacrifice"]["stakeGbp"] = sacrificeStake
-    result["limits"]["maxNominalSpendGbp"] = format(maxNominal, ".2f")
+    result["limits"]["maxNominalSpendGbp"] = (None if maxNominal is None else format(maxNominal, ".2f"))
     result["exits"] = normalizedExits
     return result
 
