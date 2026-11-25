@@ -317,11 +317,16 @@ class ExecutionStore:
         counts=dict(self.db.execute("""SELECT kind,COUNT(DISTINCT selectionId)
                   FROM transactions WHERE kind IN ('PROBE_BUY','BUY') GROUP BY kind"""))
         probes=counts.get("PROBE_BUY",0)
-        if kind=="PROBE_BUY" and probes>=self.configuredCampaign["limits"]["maxSacrifices"]:
+        limits=self.configuredCampaign["limits"]
+        maxSacrifices=limits["maxSacrifices"]
+        if kind=="PROBE_BUY" and maxSacrifices is not None and probes>=maxSacrifices:
             return False
+        maxNominal=limits["maxNominalSpendGbp"]
+        if maxNominal is None:
+            return True
         total=(self.probeGbp*probes + self.buyGbp*counts.get("BUY",0)
                + (self.probeGbp if kind=="PROBE_BUY" else self.buyGbp))
-        return total<=Decimal(self.configuredCampaign["limits"]["maxNominalSpendGbp"])
+        return total<=Decimal(maxNominal)
 
     def observe(self,**values):
         self.db.execute("""INSERT INTO observations
