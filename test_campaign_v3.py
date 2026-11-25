@@ -1,6 +1,8 @@
 """New-campaign requirements. Fail first against the recovered baseline."""
 import json
 import tempfile
+import sqlite3
+from types import SimpleNamespace
 import unittest
 from decimal import Decimal
 from pathlib import Path
@@ -69,6 +71,42 @@ class CampaignVersionThreeTests(unittest.TestCase):
         cfg["sacrifice"]["wait"] = {"unit": "seconds", "value": 10}
         with self.assertRaises(ValueError):
             validateCampaign(cfg)
+
+    def test_explicit_null_limits_and_finite_validation(self):
+        cfg = self.valid()
+        cfg["main"] = {"stakeGbp": "0.05", "maxPurchases": 20}
+        cfg["limits"] = {"maxSacrifices": None, "maxNominalSpendGbp": None}
+        normalized = validateCampaign(cfg)
+        self.assertEqual(normalized["limits"], cfg["limits"])
+        self.assertEqual(campaignDigest(normalized), campaignDigest(validateCampaign(normalized)))
+        self.assertEqual(normalized["main"]["maxPurchases"], 20)
+        for bad in (-1, "unlimited", True):
+            cfg["limits"]["maxSacrifices"] = bad
+            with self.assertRaises(ValueError):
+                validateCampaign(cfg)
+        cfg["limits"] = {"maxSacrifices": None, "maxNominalSpendGbp": "1.00"}
+        with self.assertRaises(ValueError):
+            validateCampaign(cfg)
+
+    def test_optional_caps_do_not_disable_finite_caps(self):
+        cfg = self.valid()
+        cfg["main"] = {"stakeGbp": "0.05", "maxPurchases": 20}
+        with sqlite3.connect(":memory:") as db:
+            db.execute("CREATE TABLE transactions(kind TEXT, selectionId TEXT)")
+            db.executemany("INSERT INTO transactions VALUES(?,?)",
+                           [("PROBE_BUY", str(i)) for i in range(151)])
+            store = SimpleNamespace(db=db, probeGbp=Decimal("0.01"),
+                                    buyGbp=Decimal("0.05"))
+            for count, nominal, expectedProbe, expectedBuy in (
+                (50, "10.00", False, True),
+                (None, "1.50", False, False),
+                (None, None, True, True),
+                (50, None, False, True),
+            ):
+                cfg["limits"] = {"maxSacrifices": count, "maxNominalSpendGbp": nominal}
+                store.configuredCampaign = validateCampaign(cfg)
+                self.assertEqual(ExecutionStore.canSpend(store, "PROBE_BUY"), expectedProbe)
+                self.assertEqual(ExecutionStore.canSpend(store, "BUY"), expectedBuy)
 
     def test_campaign_persisted_identity_rejects_changed_manifest_without_mutating_db(self):
         cfg = validateCampaign(self.valid())
