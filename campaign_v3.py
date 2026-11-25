@@ -17,8 +17,8 @@ def defaultCampaign(wallet: str) -> dict:
         "schemaVersion": 3,
         "chainId": 4663,
         "walletPublicAddress": wallet,
-        "selector": {"name": "buyingBlocks", "decisionSeconds": 20,
-                     "maxBuyingBlocks": 10},
+        "selector": {"name": "buyingBlocks", "decisionSeconds": 30,
+                     "minBuyingBlocks": 3, "maxBuyingBlocks": 10},
         "main": {"stakeGbp": "0.10", "maxPurchases": 5},
         "sacrifice": {"enabled": True, "stakeGbp": "0.01",
                       "wait": {"unit": "blocks", "value": 500},
@@ -90,12 +90,21 @@ def validateCampaign(raw: dict) -> dict:
             raise ValueError("UNSUPPORTED_CONCENTRATION_RULE")
         _integer(selector["firstTradeTimeoutSeconds"], "FIRST_TRADE_TIMEOUT", 30, 3600)
     elif name in ("buyingBlocks", "integrationOnly"):
-        _shape(selector, ("name", "decisionSeconds", "maxBuyingBlocks"), "SELECTOR")
+        explicitMin = "minBuyingBlocks" in selector
+        fields = ("name", "decisionSeconds", "maxBuyingBlocks")
+        _shape(selector, fields + (("minBuyingBlocks",) if explicitMin else ()), "SELECTOR")
         _integer(selector["decisionSeconds"], "SELECTOR_WINDOW", 1, 300)
+        minimum = selector.get("minBuyingBlocks", 3)
+        maximum = selector["maxBuyingBlocks"]
         if name == "buyingBlocks":
-            if selector["decisionSeconds"] not in (5, 20) or selector["maxBuyingBlocks"] not in (None, 10):
+            if explicitMin:
+                if (type(minimum) is not int or type(maximum) is not int
+                        or not 0 <= minimum <= maximum):
+                    raise ValueError("INVALID_BUYING_BLOCK_RANGE")
+            elif (selector["decisionSeconds"] not in (5, 20)
+                    or (maximum is not None and (type(maximum) is not int or maximum != 10))):
                 raise ValueError("UNSUPPORTED_BUYING_BLOCK_SELECTOR_POLICY")
-        elif selector["maxBuyingBlocks"] is not None:
+        elif maximum is not None or type(minimum) is not int or minimum != 3:
             raise ValueError("SELECTOR_POLICY_DOES_NOT_ACCEPT_BUYING_BLOCKS")
     else:
         raise ValueError("UNREGISTERED_SELECTOR")

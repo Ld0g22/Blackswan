@@ -28,23 +28,25 @@ SELECTION_SECONDS = 5.0
 REQUIRED_BLOCKS = 3
 
 
-def decisionStatus(blocks, backfillDone, subscriptionStarted, interrupted, errors,
-                   maxBuyingBlocks=None):
-    """Default ≥3 rule remains intact. Bounded 3–10 requires complete evidence.
+def validateBuyingBlockRange(minBuyingBlocks, maxBuyingBlocks):
+    if type(minBuyingBlocks) is not int or minBuyingBlocks < 0:
+        raise ValueError('INVALID_SELECTOR_MIN_BUY_BLOCKS')
+    if maxBuyingBlocks is not None and (type(maxBuyingBlocks) is not int
+                                        or maxBuyingBlocks < minBuyingBlocks):
+        raise ValueError('INVALID_SELECTOR_MAX_BUY_BLOCKS')
 
-    ≥11 observed distinct buying blocks always proves FAIL for a 3–10 rule.
-    3–10 proves PASS only when the whole window is covered: missing buy
-    blocks could otherwise turn an apparent PASS into an >10 FAIL.
-    """
+
+def decisionStatus(blocks, backfillDone, subscriptionStarted, interrupted, errors,
+                   maxBuyingBlocks=None, minBuyingBlocks=REQUIRED_BLOCKS):
+    """Bounded inclusive range requires complete evidence; legacy unbounded rule retained."""
+    validateBuyingBlockRange(minBuyingBlocks, maxBuyingBlocks)
     complete = backfillDone and subscriptionStarted and not interrupted and not errors
     if maxBuyingBlocks is not None:
-        if maxBuyingBlocks != 10:
-            raise ValueError('UNSUPPORTED_SELECTOR_MAX_BUY_BLOCKS')
         if blocks > maxBuyingBlocks:
             return 'FAIL'
-        return 'PASS' if blocks >= REQUIRED_BLOCKS and complete else (
+        return 'PASS' if blocks >= minBuyingBlocks and complete else (
             'FAIL' if complete else 'UNKNOWN')
-    if blocks >= REQUIRED_BLOCKS:
+    if blocks >= minBuyingBlocks:
         return 'PASS'
     return 'FAIL' if complete else 'UNKNOWN'
 
@@ -193,55 +195,47 @@ class Candidate:
 
 class Selector:
     def __init__(self, detectorPath, dbPath, httpUrl, wsUrl,
-                 decisionSeconds=SELECTION_SECONDS, maxBuyingBlocks=None):
-        # Only these windows have been specified and regression tested.
-        # Existing 5s campaigns retain their historical policy on resume.
-        if float(decisionSeconds) not in (5.0, 20.0):
+                 decisionSeconds=SELECTION_SECONDS, maxBuyingBlocks=None,
+                 minBuyingBlocks=REQUIRED_BLOCKS):
+        # Historical callers may pass the original integral float default.
+        if (type(decisionSeconds) not in (int, float)
+                or not 1 <= decisionSeconds <= 300
+                or int(decisionSeconds) != decisionSeconds):
             raise ValueError('UNSUPPORTED_SELECTOR_DECISION_SECONDS')
-        if maxBuyingBlocks is not None and (type(maxBuyingBlocks) is not int or maxBuyingBlocks != 10):
-            raise ValueError('UNSUPPORTED_SELECTOR_MAX_BUY_BLOCKS')
-        self.decisionSeconds = float(decisionSeconds)
+        validateBuyingBlockRange(minBuyingBlocks, maxBuyingBlocks)
+        self.decisionSeconds = int(decisionSeconds)
+        self.minBuyingBlocks = minBuyingBlocks
         self.maxBuyingBlocks = maxBuyingBlocks
         self.store = SelectorStore(dbPath)
-        stored = self.store.db.execute(
-            "SELECT value FROM meta WHERE key='decisionSeconds'").fetchone()
-        if stored is not None:
-            try:
-                matches = float(stored['value']) == self.decisionSeconds
-            except (TypeError, ValueError):
-                matches = False
-            if not matches:
-                self.store.db.close()
-                raise RuntimeError('SELECTOR_DECISION_WINDOW_MISMATCH')
-        else:
-            # Old databases lack this metadata; they are always 5s, and
-            # must never silently become 20s when resumed.
-            previous = self.store.db.execute(
-                'SELECT COUNT(*) FROM launches').fetchone()[0]
-            if previous and self.decisionSeconds != SELECTION_SECONDS:
-                self.store.db.close()
-                raise RuntimeError('SELECTOR_DECISION_WINDOW_MISMATCH')
-            self.store.db.execute(
-                "INSERT INTO meta(key,value) VALUES('decisionSeconds',?)",
-                (str(int(self.decisionSeconds)),))
-        savedMax = self.store.db.execute(
-            "SELECT value FROM meta WHERE key='maxBuyingBlocks'").fetchone()
-        intendedMax = str(self.maxBuyingBlocks) if self.maxBuyingBlocks is not None else 'NONE'
-        if savedMax is not None:
-            if savedMax['value'] != intendedMax:
-                self.store.db.close()
-                raise RuntimeError('SELECTOR_BUY_BLOCK_POLICY_MISMATCH')
-        else:
-            # All pre-existing selectors had the unbounded ≥3 rule.
-            # Do not silently apply 3–10 to an old campaign's ledger.
-            historic = self.store.db.execute(
-                'SELECT COUNT(*) FROM launches').fetchone()[0]
-            if historic and self.maxBuyingBlocks is not None:
-                self.store.db.close()
-                raise RuntimeError('SELECTOR_BUY_BLOCK_POLICY_MISMATCH')
-            self.store.db.execute(
-                "INSERT INTO meta(key,value) VALUES('maxBuyingBlocks',?)",
-                (intendedMax,))
+        db = self.store.db
+        try:
+            db.execute('BEGIN IMMEDIATE')
+            metadata = dict(db.execute('SELECT key,value FROM meta'))
+            historic = bool(db.execute('SELECT 1 FROM launches LIMIT 1').fetchone())
+            if metadata.get('selectorName', 'buyingBlocks') != 'buyingBlocks':
+                raise RuntimeError('SELECTOR_POLICY_IDENTITY_MISMATCH')
+            existingPolicy = historic or any(key in metadata for key in
+                ('decisionSeconds', 'minBuyingBlocks', 'maxBuyingBlocks', 'selectorName'))
+            expected = {
+                'decisionSeconds': str(self.decisionSeconds),
+                'minBuyingBlocks': str(self.minBuyingBlocks),
+                'maxBuyingBlocks': str(self.maxBuyingBlocks) if self.maxBuyingBlocks is not None else 'NONE',
+            }
+            defaults = {'decisionSeconds': '5', 'minBuyingBlocks': '3', 'maxBuyingBlocks': 'NONE'}
+            for key, intended in expected.items():
+                stored = metadata.get(key, defaults[key] if existingPolicy else intended)
+                if stored != intended:
+                    raise RuntimeError('SELECTOR_DECISION_WINDOW_MISMATCH' if key == 'decisionSeconds'
+                                       else 'SELECTOR_BUY_BLOCK_POLICY_MISMATCH')
+            expected.update(selectorName='buyingBlocks', selectorReady='0', selectorHeartbeat='0')
+            db.executemany('INSERT INTO meta(key,value) VALUES(?,?) '
+                           'ON CONFLICT(key) DO UPDATE SET value=excluded.value', expected.items())
+            db.execute('COMMIT')
+        except BaseException:
+            if db.in_transaction:
+                db.execute('ROLLBACK')
+            db.close()
+            raise
         self.detector = sqlite3.connect(f'file:{Path(detectorPath).resolve()}?mode=ro', uri=True, timeout=2)
         self.detector.row_factory = sqlite3.Row
         self.httpUrl, self.wsUrl = httpUrl, wsUrl
@@ -256,6 +250,12 @@ class Selector:
         self.wsMessages = 0
         self.stopping = asyncio.Event()
         self.session = None
+
+    def setReady(self, ready):
+        self.store.db.execute(
+            "INSERT INTO meta(key,value) VALUES('selectorReady',?),('selectorHeartbeat',?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            ('1' if ready else '0', str(time.time())))
 
     def spawn(self, coro):
         task = asyncio.create_task(coro)
@@ -441,7 +441,8 @@ class Selector:
             complete = cand.backfillDone and cand.subscriptionStarted and not cand.subscriptionInterrupted
             status = decisionStatus(count,cand.backfillDone,cand.subscriptionStarted,
                                     cand.subscriptionInterrupted,cand.errors,
-                                    maxBuyingBlocks=self.maxBuyingBlocks)
+                                    maxBuyingBlocks=self.maxBuyingBlocks,
+                                    minBuyingBlocks=getattr(self,'minBuyingBlocks',REQUIRED_BLOCKS))
             reason = ('buyingBlocksWithinRange' if status=='PASS' and self.maxBuyingBlocks is not None
                       else 'thresholdReached' if status=='PASS'
                       else 'aboveMaximumBuyingBlocks' if status=='FAIL'
@@ -465,6 +466,7 @@ class Selector:
                                           and not cand.subscriptionInterrupted and not cand.errors),
                   'reason':reason,'headerTimestamp':cand.deadline-getattr(self,'decisionSeconds',SELECTION_SECONDS) if cand.deadline else None,
                   'decisionSeconds':getattr(self,'decisionSeconds',SELECTION_SECONDS),
+                  'minBuyingBlocks':getattr(self,'minBuyingBlocks',REQUIRED_BLOCKS),
                   'maxBuyingBlocks':getattr(self,'maxBuyingBlocks',None),
                   'evidenceErrors':cand.errors[:6]}
         if self.store.decide(cand.eventKey,status,result):
@@ -510,13 +512,17 @@ class Selector:
                     'buyBlockHashes':[],'coverageComplete':False})
             wsTask=self.spawn(self.websocket())
             lastReport=0
+            lastHeartbeat=0
             try:
                 while not self.stopping.is_set():
                     self.pull()
+                    if time.monotonic()-lastHeartbeat>=1:
+                        self.setReady(self.connected.is_set())
+                        lastHeartbeat=time.monotonic()
                     if time.monotonic()-lastReport>=15:
                         print('SELECTOR HEALTH '+json.dumps({'decisions':self.store.status(),
                             'active':len(self.candidates),'decisionSeconds':self.decisionSeconds,
-                            'maxBuyingBlocks':self.maxBuyingBlocks,
+                            'minBuyingBlocks':self.minBuyingBlocks,'maxBuyingBlocks':self.maxBuyingBlocks,
                             'httpCalls':dict(self.rpcCounts),
                             'wsActivityMessages':self.wsMessages},separators=(',',':')),flush=True)
                         lastReport=time.monotonic()
@@ -526,6 +532,7 @@ class Selector:
                 wsTask.cancel()
                 for task in list(self.tasks): task.cancel()
                 await asyncio.gather(*self.tasks,return_exceptions=True)
+                self.setReady(False)
                 self.detector.close()
                 self.store.db.close()
 
@@ -551,10 +558,12 @@ def main():
     parser.add_argument('command',choices=['run','status'])
     parser.add_argument('--db',type=Path,required=True)
     parser.add_argument('--detector-db',type=Path)
-    parser.add_argument('--decision-seconds',type=int,choices=(5,20),default=5,
-                        help='Launch-relative cutoff: 5s legacy, 20s new five-lamb campaigns')
-    parser.add_argument('--max-buying-blocks',type=int,choices=(10,),
-                        help='Optional bounded 3–10 distinct buying blocks; default legacy ≥3')
+    parser.add_argument('--decision-seconds',type=int,choices=range(1,301),default=5,
+                        metavar='SECONDS',help='Launch-relative cutoff, 1–300 seconds (legacy CLI default 5)')
+    parser.add_argument('--min-buying-blocks',type=int,default=REQUIRED_BLOCKS,
+                        help='Inclusive minimum distinct buying blocks')
+    parser.add_argument('--max-buying-blocks',type=int,
+                        help='Inclusive maximum; omitted for legacy unbounded rule')
     parser.add_argument('--env',type=Path,default=Path.home()/'blackswanRH_guarded/.env')
     args=parser.parse_args()
     if args.command=='status':
@@ -567,10 +576,15 @@ def main():
     lock = args.db.with_suffix('.lock').open('a+')
     try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
     except BlockingIOError: raise SystemExit('Selector already running on this database') from None
+    try:
+        validateBuyingBlockRange(args.min_buying_blocks,args.max_buying_blocks)
+    except ValueError as exc:
+        parser.error(str(exc))
     http,ws=settings(args.env)
     selector=Selector(args.detector_db,args.db,http,ws,
                       decisionSeconds=args.decision_seconds,
-                      maxBuyingBlocks=args.max_buying_blocks)
+                      maxBuyingBlocks=args.max_buying_blocks,
+                      minBuyingBlocks=args.min_buying_blocks)
     loop=None
     async def runner():
         loop=asyncio.get_running_loop()

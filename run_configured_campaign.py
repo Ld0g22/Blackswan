@@ -41,13 +41,14 @@ def selectorCommand(config, root, python, env, detectorDb, selectorDb):
         str(python),"-u",str(root/"five_second_selector.py"),"run",
         "--env",str(env),"--detector-db",str(detectorDb),"--db",str(selectorDb),
         "--decision-seconds",str(selector["decisionSeconds"]),
+        "--min-buying-blocks",str(selector.get("minBuyingBlocks",3)),
         *([] if selector["maxBuyingBlocks"] is None else [
             "--max-buying-blocks",str(selector["maxBuyingBlocks"])]),
     ]
 
 
-def selectorReady(selectorDb):
-    """A concentration selector is ready only after actual chain-ID validation."""
+def selectorReady(selectorDb, selectorName="concentration"):
+    """Require the expected selector's live, chain-verified heartbeat."""
     if not Path(selectorDb).is_file():
         return False
     try:
@@ -55,9 +56,9 @@ def selectorReady(selectorDb):
             f"file:{Path(selectorDb).resolve()}?mode=ro",uri=True,timeout=.5
         ) as db:
             metadata=dict(db.execute("SELECT key,value FROM meta"))
-        return (metadata.get("selectorName")=="concentration"
+        return (metadata.get("selectorName")==selectorName
                 and metadata.get("selectorReady")=="1"
-                and time.time()-float(metadata.get("selectorHeartbeat",0))<10)
+                and 0 <= time.time()-float(metadata.get("selectorHeartbeat",0))<10)
     except (sqlite3.Error,ValueError,TypeError,OverflowError):
         return False
 
@@ -149,9 +150,7 @@ def startOrResume(args,root):
                 config,root,python,env,detDb,selDb),messages)
             workers.append(selector)
             readyDeadline=time.monotonic()+15
-            while (not selDb.is_file() or
-                   (config["selector"]["name"]=="concentration" and
-                    not selectorReady(selDb))):
+            while not selectorReady(selDb,config["selector"]["name"]):
                 drain(messages)
                 if selector.poll() is not None or time.monotonic()>readyDeadline:
                     raise RuntimeError("SELECTOR_STARTUP_FAILED_OR_WRONG_CHAIN")

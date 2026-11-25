@@ -280,7 +280,12 @@ def snapshot(directory,now=None):
         se=opened['selector']
         if se:
             try:
+                selectorMeta=dict(se.execute('SELECT key,value FROM meta'))
                 out['selector']=dict(
+                    policyName=selectorMeta.get('selectorName'),
+                    decisionSeconds=selectorMeta.get('decisionSeconds'),
+                    minBuyingBlocks=selectorMeta.get('minBuyingBlocks','3'),
+                    maxBuyingBlocks=selectorMeta.get('maxBuyingBlocks'),
                     decisions={r['status']:r['count'] for r in rows(se,
                         'SELECT status,COUNT(*) count FROM decisions GROUP BY status')},
                     launches={r['state']:r['count'] for r in rows(se,
@@ -288,6 +293,17 @@ def snapshot(directory,now=None):
                     cursor=number(value(se,"SELECT value FROM meta WHERE key='detectorCursor'",default=0)),
                     last=value(se,'SELECT decisionAt FROM decisions ORDER BY seq DESC LIMIT 1',default=None),
                     revoked=value(se,'SELECT COUNT(*) FROM revocations'))
+                if selectorMeta.get('selectorName')=='buyingBlocks':
+                    latest=[]
+                    for item in rows(se,'SELECT tokenKey,status,decisionAt,data FROM decisions ORDER BY seq DESC LIMIT 8'):
+                        try:
+                            evidence=json.loads(item.pop('data'))
+                            latest.append(dict(token=item['tokenKey'].split(':',1)[-1],
+                                status=item['status'],decisionAt=item['decisionAt'],
+                                count=evidence.get('buyBlockCount'),reason=evidence.get('reason','—')))
+                        except (ValueError,TypeError,AttributeError):
+                            out['warnings'].append('Invalid selector decision evidence')
+                    out['selector']['recent']=latest
             except sqlite3.Error as exc:
                 out['warnings'].append('selector read error: '+str(exc)[:130])
         if out['selector'] and out['detector']:
@@ -533,7 +549,23 @@ def card_pipeline(view):
     cu=d.get('usage')
     t.add_row(f"Alchemy estimated CU/24h: {int(cu):,} / 1,000,000" if cu is not None else 'Alchemy CU: —',
               f"Bought selections: {counts.get('BOUGHT',0)}  Skipped: {counts.get('SKIPPED',0)}")
-    return panel('PIPELINE HEALTH • DETECTOR & SELECTOR UNCHANGED',t,'bright_green')
+    if sel.get('policyName')=='buyingBlocks':
+        maximum=sel.get('maxBuyingBlocks')
+        t.add_row('Buying-block policy',f"{sel.get('minBuyingBlocks')}–{maximum if maximum!='NONE' else 'unbounded'} blocks / {sel.get('decisionSeconds')}s")
+    return panel('PIPELINE HEALTH • DETECTOR & SELECTOR',t,'bright_green')
+
+
+def card_buying_blocks(view):
+    t=Table(expand=True,box=box.SIMPLE,show_edge=False,padding=(0,1))
+    for heading in ('AGE','TOKEN','BLOCKS','DECISION','REASON'):
+        t.add_column(heading,no_wrap=(heading!='REASON'))
+    for item in view['selector'].get('recent',[]):
+        t.add_row(age(item['decisionAt'],view['now']),item['token'],
+                  str(item['count']) if item['count'] is not None else '—',
+                  item['status'],str(item['reason']))
+    if not view['selector'].get('recent'):
+        t.add_row('—','No selector decisions','—','—','—')
+    return panel('BUYING BLOCK SELECTOR • RECENT EVIDENCE',t,'bright_blue')
 
 
 def card_alerts(view):
@@ -561,11 +593,13 @@ def render(view,width=160):
         '[bold]'+name+'[/bold]    [cyan]'+timestamp+'[/cyan]    '
         '[bold green]READ ONLY[/bold green] • No wallet/RPC access','cyan')
     content=[banner,card_summary(view)]
-    if view['summary'].get('pilotMode'):content.append(card_finances(view))
+    if view['summary'].get('financeMode'):content.append(card_finances(view))
     if view['summary'].get('sacrifice'):content.append(card_lamb(view))
     content.extend([card_positions(view),card_proceeds(view)])
     content.extend([card_transactions(view),card_selections(view)])
-    content.extend([card_pipeline(view),card_alerts(view)])
+    content.append(card_pipeline(view))
+    if view['selector'].get('policyName')=='buyingBlocks':content.append(card_buying_blocks(view))
+    content.append(card_alerts(view))
     content.append(Text('Ctrl+C to exit   •   refresh every 2s   •   historical quotes are not realised profits',
                         style='dim'))
     return Group(*content)
@@ -574,7 +608,8 @@ def render(view,width=160):
 def pick_directory(args):
     if args.run_dir:return args.run_dir.expanduser().resolve()
     base=args.data_dir.expanduser().resolve()
-    candidates=sorted(list(base.glob('v4_lamb_flex1p5x3x_*'))+
+    candidates=sorted(list(base.glob('configured_v3_*'))+
+                      list(base.glob('v4_lamb_flex1p5x3x_*'))+
                       list(base.glob('v4_lamb_flex3x5x_*'))+
                        list(base.glob('v4_lamb_flex2x_*'))+
                       list(base.glob('v4_lamb_1x20p_2x_*'))+
