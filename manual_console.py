@@ -7,7 +7,7 @@ import sqlite3
 import time
 from uuid import uuid4
 import manual_sale
-from manual_exit_engine import reserveRemaining
+from manual_exit_engine import reserveRemaining, processIdentity
 
 ACTIVE=manual_sale.ACTIVE
 DONE=('PREVIEW_READY','PREVIEW_FAILED','CONFIRMED','FAILED','BLOCKED','UNVERIFIED','CANCELLED','EXPIRED')
@@ -16,11 +16,15 @@ def meta(db):
     return dict(db.execute("SELECT key,value FROM meta"))
 
 def live(metadata):
-    return 0<=time.time()-float(metadata.get('manualExitHeartbeat') or 0)<=20
+    try:return 0<=time.time()-float(metadata.get('manualExitHeartbeat') or 0)<=20
+    except (TypeError,ValueError,OverflowError):return False
 
 def controlled(metadata):
+    identity=metadata.get('manualControlProcess','')
+    if not identity or ':' not in identity:return False
     return (live(metadata) and metadata.get('manualControlVersion')=='1'
-            and metadata.get('manualControlHeartbeat')==metadata.get('manualExitHeartbeat'))
+            and metadata.get('manualControlHeartbeat')==metadata.get('manualExitHeartbeat')
+            and identity==processIdentity(identity.split(':',1)[0]))
 
 def positions(db):
     m=meta(db)

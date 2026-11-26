@@ -23,7 +23,7 @@ from wallet_transactions import TransactionJournal, decodeKeystore
 from sacrificial_lamb import LambGate
 from probe_buying_blocks import MAX_BUYING_BLOCKS
 from held_venue_watch import HeldVenueWatcher
-from manual_exit_engine import ManualExitEngine, installManualSchema
+from manual_exit_engine import ManualExitEngine, installManualSchema, processIdentity
 from campaign_config import (FLEX_KIND, FLEX_POLICY, PILOT_KIND, PILOT_POLICY,
     EARLY_KIND, EARLY_POLICY, EARLY_TRIGGER_MULTIPLES, flexSettings,
     globalWalletLock, otherLiveExecutors)
@@ -1202,6 +1202,8 @@ class LiveExecutor:
                 if position['nextDue']<=now:
                     self.spawn('QUOTE:'+position['selectionId'],
                                self.checkPosition(position))
+                if self.manual and self.manual.active(position['selectionId']):
+                    continue
                 triggered=any((self.store.stageRow(position['selectionId'],stage)['triggered']
                                and not self.store.stageRow(position['selectionId'],stage)['sold'])
                               if self.store.configuredCampaign is not None
@@ -1249,6 +1251,7 @@ class LiveExecutor:
                 self.lastStatus=now
                 if self.lamb:self.store.set('executorHeartbeat',now)
                 if self.manual:
+                    self.store.set('manualControlProcess',processIdentity())
                     self.store.set('manualControlHeartbeat',now)
                     self.store.set('manualExitHeartbeat',now)
                 print('LIVE HEALTH',json.dumps(self.store.status()),flush=True)

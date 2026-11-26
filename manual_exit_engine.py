@@ -4,6 +4,8 @@ The CLI never decrypts/signs. The existing executor is the ONLY wallet
 signer and journal owner. Durable requests/receipts live in the same DB.
 """
 import json
+import os
+from pathlib import Path
 import time
 from decimal import Decimal, ROUND_UP, ROUND_DOWN
 
@@ -55,6 +57,18 @@ def installManualSchema(store):
     store.set('manualExitVersion','1')
     store.set('manualControlVersion','1')
     store.set('manualControlHeartbeat','0')
+    store.set('manualControlProcess','')
+
+
+def processIdentity(pid=None):
+    """Bind capability to the running Linux process, not a stale DB marker."""
+    pid=os.getpid() if pid is None else int(pid)
+    try:
+        fields=Path(f'/proc/{pid}/stat').read_text().rsplit(')',1)[1].split()
+        if fields[0]=='Z':return ''
+        return f'{pid}:{fields[19]}'
+    except (OSError,ValueError,IndexError):
+        return ''
 
 
 def reserveRemaining(db,position,remaining):
@@ -214,6 +228,18 @@ class ManualExitEngine:
                         self.setStatus(requestId,'WAITING_SELL',
                                        'AWAITING_CHAIN_RECEIPT:'+sale['txHash'])
                 continue
+            # Recover a signed approval even if the process stopped before it
+            # wrote the request's approvalIntent field.
+            prefix='manual:approve:'+requestId+':'
+            orphan=self.db.execute("SELECT * FROM transactions WHERE substr(intentId,1,length(?))=? "
+                "AND state IN ('SIGNED','SENT','UNCERTAIN','REJECTED','STUCK') "
+                "ORDER BY createdAt DESC LIMIT 1",(prefix,prefix)).fetchone()
+            if orphan and (request['status']!='WAITING_APPROVAL' or
+                           request['approvalIntent']!=orphan['intentId']):
+                self.db.execute("UPDATE manual_requests SET status='WAITING_APPROVAL',"
+                    "approvalIntent=?,txHash=?,updatedAt=? WHERE requestId=?",
+                    (orphan['intentId'],orphan['txHash'],time.time(),requestId))
+                request=self.row(requestId)
             if request['status']=='WAITING_APPROVAL' and request['approvalIntent']:
                 approval=self.db.execute('SELECT * FROM transactions WHERE intentId=?',
                                         (request['approvalIntent'],)).fetchone()
@@ -416,6 +442,15 @@ class ManualExitEngine:
                 return
             if str(exc)=='WALLET_TRANSACTION_IN_FLIGHT':
                 self.setStatus(requestId,'QUEUED','WAITING_FOR_WALLET_TRANSACTION')
+                return
+            # A journaled intent may already be signed even if the later RPC
+            # or request update raised. Never release its sale lock as FAILED.
+            prefix='manual:approve:'+requestId+':'
+            if self.db.execute("SELECT 1 FROM transactions WHERE intentId=? OR "
+                    "(substr(intentId,1,length(?))=? AND state IN "
+                    "('SIGNED','SENT','UNCERTAIN','REJECTED','STUCK'))",
+                    ('manual:sell:'+requestId,prefix,prefix)).fetchone():
+                self.reconcile()
                 return
             self.setStatus(requestId,'FAILED',
                            type(exc).__name__+':'+str(exc)[:160])
