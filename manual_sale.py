@@ -18,11 +18,11 @@ from campaign_config import (FLEX_KIND, FLEX_POLICY, PILOT_KIND, PILOT_POLICY,
 ACTIVE=('QUEUED','PREPARING','WAITING_APPROVAL','WAITING_SELL','BLOCKED','UNVERIFIED')
 
 
-def connect(directory):
+def connect(directory,readOnly=False):
     path=directory/'execution.sqlite3'
     if not path.is_file():
         raise RuntimeError('NO_EXECUTION_DB:'+str(path))
-    db=sqlite3.connect('file:'+str(path.resolve())+'?mode=rw',uri=True,timeout=5,
+    db=sqlite3.connect(path.resolve().as_uri()+('?mode=ro' if readOnly else '?mode=rw'),uri=True,timeout=5,
                        isolation_level=None)
     db.row_factory=sqlite3.Row
     db.execute('PRAGMA busy_timeout=5000')

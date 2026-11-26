@@ -4,13 +4,15 @@ The CLI never decrypts/signs. The existing executor is the ONLY wallet
 signer and journal owner. Durable requests/receipts live in the same DB.
 """
 import json
+import os
+from pathlib import Path
 import time
-from decimal import Decimal, ROUND_UP
+from decimal import Decimal, ROUND_UP, ROUND_DOWN
 
 from swap_adapters import WETH
 
 ACTIVE = ('QUEUED','PREPARING','WAITING_APPROVAL','WAITING_SELL','BLOCKED','UNVERIFIED')
-TERMINAL = ('CONFIRMED','FAILED')
+TERMINAL = ('CONFIRMED','FAILED','CANCELLED','EXPIRED')
 WEI = Decimal(10)**18
 
 
@@ -48,8 +50,39 @@ def installManualSchema(store):
       gasWei TEXT NOT NULL,
       confirmedAt REAL NOT NULL);
     CREATE INDEX IF NOT EXISTS manual_req_status ON manual_requests(status,createdAt);
+    CREATE TABLE IF NOT EXISTS manual_request_controls(
+      requestId TEXT PRIMARY KEY, expiresAt REAL NOT NULL,
+      reserveOnly INTEGER NOT NULL CHECK(reserveOnly IN (0,1)));
     """)
     store.set('manualExitVersion','1')
+    store.set('manualControlVersion','1')
+    store.set('manualControlHeartbeat','0')
+    store.set('manualControlProcess','')
+
+
+def processIdentity(pid=None):
+    """Bind capability to the running Linux process, not a stale DB marker."""
+    pid=os.getpid() if pid is None else int(pid)
+    try:
+        fields=Path(f'/proc/{pid}/stat').read_text().rsplit(')',1)[1].split()
+        if fields[0]=='Z':return ''
+        return f'{pid}:{fields[19]}'
+    except (OSError,ValueError,IndexError):
+        return ''
+
+
+def reserveRemaining(db,position,remaining):
+    """Configured reserve uses original receipt quantity, including rounding dust."""
+    sid=position['selectionId']
+    rows=db.execute("SELECT percent FROM exit_slices WHERE selectionId=?",(sid,)).fetchall()
+    if not rows:
+        return None
+    original=int(position['originalQty'])
+    total=sum(Decimal(row[0]) for row in rows)
+    reserved=original-int((Decimal(original)*total/100).to_integral_value(rounding=ROUND_DOWN))
+    manuallySold=sum(int(row[0]) for row in db.execute(
+        "SELECT tokenDebited FROM manual_fills WHERE selectionId=?",(sid,)))
+    return min(remaining,max(0,reserved-manuallySold))
 
 
 class ManualExitEngine:
@@ -141,7 +174,7 @@ class ManualExitEngine:
         """Receipts are authoritative. Idempotent across process restarts."""
         requests=self.db.execute("""
             SELECT * FROM manual_requests WHERE operation='SELL'
-            AND status NOT IN ('CONFIRMED','FAILED') ORDER BY createdAt""").fetchall()
+            AND status NOT IN ('CONFIRMED','FAILED','CANCELLED','EXPIRED') ORDER BY createdAt""").fetchall()
         for request in requests:
             requestId=request['requestId']
             sellIntent='manual:sell:'+requestId
@@ -195,6 +228,18 @@ class ManualExitEngine:
                         self.setStatus(requestId,'WAITING_SELL',
                                        'AWAITING_CHAIN_RECEIPT:'+sale['txHash'])
                 continue
+            # Recover a signed approval even if the process stopped before it
+            # wrote the request's approvalIntent field.
+            prefix='manual:approve:'+requestId+':'
+            orphan=self.db.execute("SELECT * FROM transactions WHERE substr(intentId,1,length(?))=? "
+                "AND state IN ('SIGNED','SENT','UNCERTAIN','REJECTED','STUCK') "
+                "ORDER BY createdAt DESC LIMIT 1",(prefix,prefix)).fetchone()
+            if orphan and (request['status']!='WAITING_APPROVAL' or
+                           request['approvalIntent']!=orphan['intentId']):
+                self.db.execute("UPDATE manual_requests SET status='WAITING_APPROVAL',"
+                    "approvalIntent=?,txHash=?,updatedAt=? WHERE requestId=?",
+                    (orphan['intentId'],orphan['txHash'],time.time(),requestId))
+                request=self.row(requestId)
             if request['status']=='WAITING_APPROVAL' and request['approvalIntent']:
                 approval=self.db.execute('SELECT * FROM transactions WHERE intentId=?',
                                         (request['approvalIntent'],)).fetchone()
@@ -208,11 +253,41 @@ class ManualExitEngine:
                     self.setStatus(requestId,'BLOCKED','APPROVAL_TX_'+approval['state'])
             # QUEUED and PREPARING are recovered by the normal run loop.
 
+    def expired(self,requestId):
+        control=self.db.execute("SELECT expiresAt FROM manual_request_controls WHERE requestId=?",
+                                (requestId,)).fetchone()
+        return bool(control and time.time()>=float(control[0]))
+
+    def expireUnsigned(self,requestId):
+        if not self.expired(requestId):
+            return False
+        if self.db.execute("SELECT 1 FROM transactions WHERE intentId=? OR "
+                           "(substr(intentId,1,length(?))=? AND state IN "
+                           "('SIGNED','SENT','UNCERTAIN','REJECTED','STUCK'))",
+                           ('manual:sell:'+requestId,'manual:approve:'+requestId+':',
+                            'manual:approve:'+requestId+':')).fetchone():
+            return False
+        self.db.execute("UPDATE manual_requests SET status='EXPIRED',updatedAt=?,"
+                        "reason='OPERATOR_DEADLINE_BEFORE_SIGNING' WHERE requestId=? "
+                        "AND status IN ('QUEUED','PREPARING')",(time.time(),requestId))
+        return True
+
+    def priorityPending(self):
+        return bool(self.db.execute("SELECT 1 FROM manual_requests WHERE operation='SELL' "
+            "AND status IN ('QUEUED','PREPARING','WAITING_APPROVAL','WAITING_SELL') LIMIT 1").fetchone())
+
     def tick(self):
         self.reconcile()
+        # Only controlled requests expire. Legacy queued requests retain their old semantics.
+        for row in self.db.execute("SELECT r.requestId FROM manual_requests r "
+                "JOIN manual_request_controls c ON c.requestId=r.requestId "
+                "WHERE r.status IN ('QUEUED','PREPARING') AND c.expiresAt<=?",(time.time(),)).fetchall():
+            key=('MANUAL_PREVIEW:' if self.row(row[0])['operation']=='PREVIEW' else 'MANUAL_EXIT:')+row[0]
+            if key not in self.owner.active:
+                self.expireUnsigned(row[0])
         previews=self.db.execute("""
             SELECT requestId FROM manual_requests
-            WHERE operation='PREVIEW' AND status='QUEUED'
+            WHERE operation='PREVIEW' AND status IN ('QUEUED','PREPARING')
             ORDER BY createdAt LIMIT 2""").fetchall()
         for row in previews:
             self.owner.spawn('MANUAL_PREVIEW:'+row['requestId'],
@@ -228,12 +303,20 @@ class ManualExitEngine:
     async def quote(self,request,position):
         token=position['token']
         chainBalance=await self.owner.balance(token)
-        probe=self.owner.lamb.probeQuantity(position['selectionId'])
+        lamb=getattr(self.owner,'lamb',None)
+        probe=lamb.probeQuantity(position['selectionId']) if lamb else 0
         available=min(self.mainRemaining(position),max(0,chainBalance-probe))
         if available<=0:
             raise RuntimeError('NO_REMAINING_MAIN_TOKENS')
         percent=int(request['percent'])
-        quantity=available if percent==100 else available*percent//100
+        control=self.db.execute('SELECT reserveOnly FROM manual_request_controls WHERE requestId=?',
+                                (request['requestId'],)).fetchone()
+        if control and control[0]:
+            reserve=reserveRemaining(self.db,position,self.mainRemaining(position))
+            if reserve is None:raise RuntimeError('RESERVE_REQUIRES_CONFIGURED_CAMPAIGN')
+            quantity=min(available,reserve)
+        else:
+            quantity=available if percent==100 else available*percent//100
         if quantity<=0:
             raise RuntimeError('MANUAL_SLICE_TOO_SMALL')
         latest=(await self.owner.swaps.directQuotes(token,quantity,False))[0]
@@ -245,7 +328,7 @@ class ManualExitEngine:
         rate=await self.owner.fx.get()
         gbp=Decimal(output)*rate/WEI
         minGbp=Decimal(request['minGbp'])
-        if minGbp<0:
+        if not minGbp.is_finite() or minGbp<0:
             raise ValueError('NEGATIVE_MIN_GBP')
         if gbp<minGbp:
             raise RuntimeError('FRESH_QUOTE_BELOW_OPERATOR_MINIMUM')
@@ -261,10 +344,17 @@ class ManualExitEngine:
             latest,quantity,self.owner.tx.account.address,minimumOut=minOut)
         return quantity,latest,swap,gbp,minOut
 
+    def claim(self,requestId):
+        # Atomic against an operator's cancellation from another process.
+        return self.db.execute("UPDATE manual_requests SET status='PREPARING',updatedAt=? "
+            "WHERE requestId=? AND status IN ('QUEUED','PREPARING')",
+            (time.time(),requestId)).rowcount==1
+
     async def preview(self,requestId):
         request=self.row(requestId)
-        if not request or request['status']!='QUEUED':return
-        self.setStatus(requestId,'PREPARING')
+        if not request or request['status'] not in ('QUEUED','PREPARING'):return
+        if self.expireUnsigned(requestId):return
+        if not self.claim(requestId):return
         try:
             position=self.position(request['selectionId'])
             if not position:raise RuntimeError('NO_POSITION')
@@ -277,6 +367,7 @@ class ManualExitEngine:
                 gas=str(int(estimate,16))
             except (RuntimeError,ValueError,TypeError):
                 pass  # A new allowance may be required before swap simulation.
+            if self.expireUnsigned(requestId):return
             self.db.execute("""UPDATE manual_requests
               SET status='PREVIEW_READY',updatedAt=?,quantity=?,quoteWei=?,
                   quoteGbp=?,quoteBlock=?,minOutWei=?,gasEstimate=?,reason=NULL
@@ -291,6 +382,7 @@ class ManualExitEngine:
         request=self.row(requestId)
         if not request or request['status'] not in ('QUEUED','PREPARING'):return
         selectionId=request['selectionId']
+        if self.expireUnsigned(requestId):return
         # Never sign while ANY wallet transaction is unresolved, including
         # an automatic exit that reached the signer just before manual entry.
         if self.owner.tx.unsettled():
@@ -299,7 +391,7 @@ class ManualExitEngine:
                            ('manual:sell:'+requestId,)).fetchone():
             self.setStatus(requestId,'WAITING_SELL')
             return
-        self.setStatus(requestId,'PREPARING')
+        if not self.claim(requestId):return
         try:
             position=self.position(selectionId)
             if not position:raise RuntimeError('NO_POSITION')
@@ -308,6 +400,7 @@ class ManualExitEngine:
             # exclusivity and fresh eth_call validation are still required.
             approval=await self.owner.swaps.approvalNeeded(
                 quote,position['token'],self.owner.tx.account.address,qty)
+            if self.expireUnsigned(requestId):return
             if approval:
                 intent=('manual:approve:'+requestId+':'+str(approval[0])+':'+
                         str(approval[2]).lower())
@@ -344,8 +437,20 @@ class ManualExitEngine:
                   'qty',qty,'quoteGBP',gbp,'minOutWei',minOut,
                   'tx',tx['txHash'],flush=True)
         except (RuntimeError,ValueError,TypeError,KeyError,IndexError) as exc:
+            if str(exc)=='MANUAL_REQUEST_EXPIRED':
+                self.expireUnsigned(requestId)
+                return
             if str(exc)=='WALLET_TRANSACTION_IN_FLIGHT':
                 self.setStatus(requestId,'QUEUED','WAITING_FOR_WALLET_TRANSACTION')
+                return
+            # A journaled intent may already be signed even if the later RPC
+            # or request update raised. Never release its sale lock as FAILED.
+            prefix='manual:approve:'+requestId+':'
+            if self.db.execute("SELECT 1 FROM transactions WHERE intentId=? OR "
+                    "(substr(intentId,1,length(?))=? AND state IN "
+                    "('SIGNED','SENT','UNCERTAIN','REJECTED','STUCK'))",
+                    ('manual:sell:'+requestId,prefix,prefix)).fetchone():
+                self.reconcile()
                 return
             self.setStatus(requestId,'FAILED',
                            type(exc).__name__+':'+str(exc)[:160])

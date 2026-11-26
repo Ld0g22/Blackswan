@@ -23,7 +23,7 @@ from wallet_transactions import TransactionJournal, decodeKeystore
 from sacrificial_lamb import LambGate
 from probe_buying_blocks import MAX_BUYING_BLOCKS
 from held_venue_watch import HeldVenueWatcher
-from manual_exit_engine import ManualExitEngine, installManualSchema
+from manual_exit_engine import ManualExitEngine, installManualSchema, processIdentity
 from campaign_config import (FLEX_KIND, FLEX_POLICY, PILOT_KIND, PILOT_POLICY,
     EARLY_KIND, EARLY_POLICY, EARLY_TRIGGER_MULTIPLES, flexSettings,
     globalWalletLock, otherLiveExecutors)
@@ -1183,6 +1183,7 @@ class LiveExecutor:
             self.readNewVenues()
             await self.reconcileReceipts()
             if self.manual:self.manual.tick()
+            manualPriority=bool(self.manual and self.manual.priorityPending())
             now=time.time()
             if self.lamb and self.store.get('intakeState','OPEN')=='CLOSED' and now-self.lastVenueCheck>=0.4:
                 self.lastVenueCheck=now
@@ -1190,9 +1191,7 @@ class LiveExecutor:
             # A latched threshold creates an urgent sale obligation. Launch
             # those exits before any fresh buy can take the wallet nonce.
             positions=self.store.db.execute(
-                ("SELECT p.* FROM positions p WHERE EXISTS ("
-                 "SELECT 1 FROM exit_slices e WHERE e.selectionId=p.selectionId AND e.sold=0)"
-                 " ORDER BY p.boughtAt" if self.store.configuredCampaign is not None
+                ("SELECT p.* FROM positions p ORDER BY p.boughtAt" if self.store.configuredCampaign is not None
                  else "SELECT * FROM positions WHERE sold100=0 ORDER BY boughtAt" if self.store.newLadder2x
                  else "SELECT * FROM positions WHERE sold1000=0 ORDER BY boughtAt" if self.lamb
                  else "SELECT * FROM positions WHERE sold10=0 ORDER BY boughtAt")).fetchall()
@@ -1203,6 +1202,8 @@ class LiveExecutor:
                 if position['nextDue']<=now:
                     self.spawn('QUOTE:'+position['selectionId'],
                                self.checkPosition(position))
+                if self.manual and self.manual.active(position['selectionId']):
+                    continue
                 triggered=any((self.store.stageRow(position['selectionId'],stage)['triggered']
                                and not self.store.stageRow(position['selectionId'],stage)['sold'])
                               if self.store.configuredCampaign is not None
@@ -1217,7 +1218,7 @@ class LiveExecutor:
             # Otherwise, prepare exit allowances before opening more positions:
             # new buys must not consume the next wallet nonce first.
             approvalDue=False
-            if not urgentExit:
+            if not urgentExit and not manualPriority:
                 for position in positions:
                     if self.manual and (self.manual.active(position['selectionId'])
                                         or self.manual.mainRemaining(position)<=0):
@@ -1230,7 +1231,7 @@ class LiveExecutor:
                         self.spawn('APPROVE:'+position['selectionId'],
                                    self.preApprove(position))
             approvalActive=any(key.startswith('APPROVE:') for key in self.active)
-            if not urgentExit and not approvalDue and not approvalActive:
+            if not manualPriority and not urgentExit and not approvalDue and not approvalActive:
                 for row in self.store.db.execute(
                     "SELECT * FROM selections WHERE status='QUEUED' ORDER BY decisionAt LIMIT 20"):
                     self.spawn('BUY:'+row['selectionId'],self.buy(row))
@@ -1249,7 +1250,10 @@ class LiveExecutor:
             if now-self.lastStatus>=5:
                 self.lastStatus=now
                 if self.lamb:self.store.set('executorHeartbeat',now)
-                if self.manual:self.store.set('manualExitHeartbeat',now)
+                if self.manual:
+                    self.store.set('manualControlProcess',processIdentity())
+                    self.store.set('manualControlHeartbeat',now)
+                    self.store.set('manualExitHeartbeat',now)
                 print('LIVE HEALTH',json.dumps(self.store.status()),flush=True)
             await asyncio.sleep(0.25)
 
