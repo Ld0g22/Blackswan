@@ -110,6 +110,15 @@ class TransactionJournal:
             # Keep RPC calls as-is; checksum the exact same 20 bytes for signing.
             from eth_utils import to_checksum_address
             tx['to'] = to_checksum_address(tx['to'])
+            # A controlled manual instruction can expire during slow RPC simulation.
+            # Existing signed intents are returned above and are never discarded.
+            if kind in ('MANUAL_SELL','MANUAL_APPROVE') and self.store.db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='manual_request_controls'").fetchone():
+                requestId=intentId.split(':',3)[2]
+                control=self.store.db.execute(
+                    "SELECT expiresAt FROM manual_request_controls WHERE requestId=?",(requestId,)).fetchone()
+                if control and time.time()>=float(control[0]):
+                    raise RuntimeError('MANUAL_REQUEST_EXPIRED')
             signed = self.account.sign_transaction(tx)
             raw = getattr(signed,'raw_transaction',None)
             if raw is None:  # Support only explicitly verified SDK attributes.
