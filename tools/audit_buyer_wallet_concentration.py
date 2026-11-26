@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Read-only buyer identity audit. No log scans, signing, or campaign changes."""
 import argparse
-from collections import Counter, defaultdict
+from collections import defaultdict
+from contextlib import closing
 from decimal import Decimal
 import gzip
 import json
@@ -171,7 +172,7 @@ def collect(root):
         sdpath=path.parent/'selector.sqlite3'
         if not sdpath.exists():continue
         try:
-            with ro(path) as ed,ro(sdpath) as sd:
+            with closing(ro(path)) as ed,closing(ro(sdpath)) as sd:
                 for sel in rows(ed,'SELECT * FROM selections'):
                     try:
                         d=json.loads(sel['event'])
@@ -181,6 +182,8 @@ def collect(root):
                         token=addr(sel['token']);kind,name,labelKey=label(token)
                         item=dict(campaign=str(path.parent),token=token,label=kind,name=name,labelKey=labelKey,
                                   selectionId=sel['selectionId'],decision=d,outcome=o)
+                        if kind=='OTHER_PURCHASE' and o['peakObservedMultiple'] is not None and Decimal(o['peakObservedMultiple'])>=3:
+                            item['label']='ADDITIONAL_3X_OBSERVED'
                         cohort.append(item)
                         try:
                             original=rows(sd,'SELECT * FROM decisions WHERE eventKey=?',(sel['selectionId'],))
@@ -199,6 +202,7 @@ def sweep(cohort,metric):
     w=[x for x in cohort if x['label']=='KNOWN_WINNER']
     l=[x for x in cohort if x['label']=='TARGET_LOSER']
     others=[x for x in cohort if x['label']=='OTHER_PURCHASE']
+    additional=[x for x in cohort if x['label']=='ADDITIONAL_3X_OBSERVED']
     expected=set(WINNERS)|LOSERS
     present={x['labelKey'] for x in w+l}
     def val(x):
@@ -213,6 +217,8 @@ def sweep(cohort,metric):
         results.append(dict(thresholdNumerator=cut.numerator,thresholdDenominator=cut.denominator,
                             thresholdPct=str(Decimal(cut.numerator)*100/Decimal(cut.denominator)),
                             knownWinnersRetained=retained,targetLosersRejected=rejected,
+                            additional3xObservedRetained=[x['token'] for x in additional if val(x) is not None and val(x)<=cut],
+                            additional3xObservedRejected=[x['token'] for x in additional if val(x) is not None and val(x)>cut],
                             otherPurchasesRejected=[x['token'] for x in others if val(x) is not None and val(x)>cut],
                             unknown=unknown,missingLabels=sorted(expected-present),
                             perfectHistoricalSeparation=(expected<=present and len(retained)==len(w) and len(rejected)==len(l))))
@@ -252,7 +258,7 @@ def main():
     if number(rpc.call('eth_chainId',[]))!=CHAIN:raise RuntimeError('WRONG_CHAIN')
     cohort,errors=collect(a.data_dir)
     # Prioritize the named four winners and two target losers, then all other purchases.
-    cohort.sort(key=lambda c:(c['label']=='OTHER_PURCHASE',c['decision']['decisionAt']))
+    cohort.sort(key=lambda c:(0 if c['label'] in ('KNOWN_WINNER','TARGET_LOSER') else 1 if c['label']=='ADDITIONAL_3X_OBSERVED' else 2,c['decision']['decisionAt']))
     print('MATCHED MAIN PURCHASES',len(cohort),flush=True)
     for c in cohort:
         if 'swaps' not in c:
@@ -276,6 +282,10 @@ def main():
                 missingKnownLabels=sorted((set(WINNERS)|LOSERS)-{c['labelKey'] for c in cohort}))
     a.output.parent.mkdir(parents=True,exist_ok=True)
     with gzip.open(a.output,'wt') as f:json.dump(report,f,separators=(',',':'))
+    for metric in ('signerThresholds','recipientThresholds'):
+        perfect=[x for x in report[metric] if x['perfectHistoricalSeparation']]
+        print(metric,'perfect separation thresholds:',len(perfect),flush=True)
+        if perfect:print('  lowest:',perfect[0]['thresholdPct'],'highest:',perfect[-1]['thresholdPct'],flush=True)
     print('AUDIT CREATED:',a.output,'RPC requests:',rpc.calls,'missing known labels:',report['missingKnownLabels'],flush=True)
 
 if __name__=='__main__':main()
