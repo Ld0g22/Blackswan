@@ -568,8 +568,15 @@ class LiveExecutor:
         # 25725498245903809899643 on Robinhood chain (October/November 2026).
         # Fee and spacing come from the selector's *launch-time* venue,
         # not from later liquidity events or a post-buy observation.
-        # Apply to new sacrificial campaigns only; leave legacy mode alone.
-        if (self.store.sacrifice
+        # Configured buying-block and concentration campaigns share the
+        # established Build Two exclusions, independent of sacrifice mode.
+        # Leave non-configured legacy behavior unchanged.
+        config=getattr(self.store,'configuredCampaign',None)
+        configuredPolicy=bool(config and config.get('selector',{}).get('name') in
+                              ('buyingBlocks','concentration'))
+        if configuredPolicy and token.lower().endswith('7777'):
+            return 'EXPERIMENT_BANNED_TOKEN_SUFFIX_7777'
+        if ((self.store.sacrifice or configuredPolicy)
                 and int(venue.get('fee',-1))==10000
                 and int(venue.get('spacing',-1))==200
                 and str(venue.get('hooks','')).lower()=='0x'+'0'*40):
