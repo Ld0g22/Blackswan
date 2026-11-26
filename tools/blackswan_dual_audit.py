@@ -41,13 +41,18 @@ def key(l): return tuple(num(l[x]) for x in ('blockNumber','transactionIndex','l
 def word(n): return f'{n%(1<<256):064x}'
 
 class Rpc:
-    def __init__(self): self.calls=0; self.blocks={}
+    def __init__(self,url=RPC): self.calls=0; self.blocks={}; self.url=url
     def call(self,method,params):
+        if self.calls>=400: raise RuntimeError('GLOBAL_RPC_CALL_BUDGET_400')
+        if self.url!=RPC: time.sleep(0.15)
         self.calls+=1
         body=json.dumps(dict(jsonrpc='2.0',id=self.calls,method=method,params=params)).encode()
-        with urlopen(Request(RPC,body,{'Content-Type':'application/json'}),timeout=15) as r:
-            payload=json.load(r)
-        if 'error' in payload: raise RuntimeError(str(payload['error'])[:350])
+        try:
+            with urlopen(Request(self.url,body,{'Content-Type':'application/json'}),timeout=15) as r:
+                payload=json.load(r)
+        except Exception as e:
+            raise RuntimeError(type(e).__name__+': '+str(getattr(e,'code','TRANSPORT_ERROR'))) from None
+        if 'error' in payload: raise RuntimeError(str(payload['error']).replace(self.url,'[redacted]')[:350])
         return payload['result']
     def block(self,b):
         if b not in self.blocks:
@@ -164,10 +169,16 @@ def campaign(db,path,token,rpc,head,afterBlocks):
             out['chainTransactions'].append(txinfo)
         except Exception as e: errors.append('receipt '+tx['txHash']+': '+str(e)[:180])
     start=num(event['blockNumber']); last=max(purchaseBlocks or [start]); end=min(head,last+afterBlocks)
+    # Keep the follow-up focused on the first permanent quote-loss interval.
+    successful=[q for q in out['observations'] if q['phase']=='SELL' and q['gbp'] is not None and q['block']]
+    if successful:
+        final=max(successful,key=lambda q:q['at'])
+        if any(q['phase']=='SELL' and q['at']>final['at'] and q['status']=='UNAVAILABLE' for q in out['observations']):
+            end=min(end,max(last,num(final['block']))+150)
     if end-start>20000:
         errors.append('SCAN_BOUNDED: only first 20001 blocks from launch; purchase may lie outside scan')
         end=start+20000
-    out['scan']={'start':start,'end':end,'headAtStart':head,'actualPurchasePoolIdsIncludingBridges':sorted(actualPools)}
+    out['scan']={'start':start,'end':end,'headAtStart':head,'focusedOnFinalQuoteLoss':True,'actualPurchasePoolIdsIncludingBridges':sorted(actualPools)}
     try: out['launchBlock']=rpc.block(start)
     except Exception as e: errors.append('launch block: '+str(e)[:180])
     venues={}
@@ -237,16 +248,21 @@ def campaign(db,path,token,rpc,head,afterBlocks):
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--data-dir',type=Path,default=Path('data'))
+    parser.add_argument('--env',type=Path,help='Explicit opt-in to existing Alchemy environment; uses provider credits, never exports the endpoint')
     parser.add_argument('--after-blocks',type=int,default=10000)
     parser.add_argument('--output',type=Path,default=Path.home()/'Downloads/blackswan-dual-audit.json.gz')
     a=parser.parse_args()
     if not 1<=a.after_blocks<=20000: parser.error('--after-blocks must be 1..20000')
-    rpc=Rpc(); report=dict(tokens=TOKENS,chainId=4663,rpc=RPC,startedAt=time.time(),campaigns=[],errors=[])
+    url=RPC
+    if a.env:
+        from detector import loadEnv
+        url=loadEnv(a.env.expanduser())['ROBINHOOD_ALCHEMY_HTTP_URL']
+    rpc=Rpc(url); report=dict(tokens=TOKENS,chainId=4663,rpc='EXPLICIT_ALCHEMY_ENV' if a.env else RPC,startedAt=time.time(),campaigns=[],errors=[])
     head=None
     try:
         if num(rpc.call('eth_chainId',[]))!=4663: raise RuntimeError('WRONG_CHAIN')
         head=num(rpc.call('eth_blockNumber',[]))
-    except Exception as e: report['errors'].append('Public RPC unavailable: '+str(e)[:200])
+    except Exception as e: report['errors'].append('RPC unavailable: '+str(e)[:200])
     matches=set()
     for path in sorted(a.data_dir.rglob('execution.sqlite3')):
         try:
