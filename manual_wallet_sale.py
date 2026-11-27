@@ -107,19 +107,30 @@ async def indexedWalletTokens(session, url, wallet):
             async with session.post(url,json=request,
                     timeout=aiohttp.ClientTimeout(total=12)) as response:
                 result=await response.json(content_type=None)
-            if response.status!=200 or 'error' in result:
-                msg=str(result.get('error',response.status))[:180]
-                return tokens,False,'indexer_unavailable:'+msg
-            payload=result['result']
-            if not isinstance(payload.get('tokenBalances'),list):
+            if response.status!=200:
+                return tokens,False,'INDEXER_HTTP_'+str(response.status)
+            if not isinstance(result,dict):
+                return tokens,False,'INVALID_INDEXER_RESPONSE'
+            if result.get('error') is not None:
+                return tokens,False,'INDEXER_RPC_ERROR'
+            payload=result.get('result')
+            if not isinstance(payload,dict) or not isinstance(payload.get('tokenBalances'),list):
                 return tokens,False,'invalid_token_balance_response'
+            invalidRows=False
             for row in payload['tokenBalances']:
+                if not isinstance(row,dict) or row.get('error') is not None or row.get('tokenBalance') is None:
+                    invalidRows=True
+                    continue
                 try:
                     if row.get('tokenBalance') and int(row['tokenBalance'],16)>0:
                         tokens.add(tokenAddress(row['contractAddress']))
                 except (KeyError,ValueError,TypeError):
-                    continue
+                    invalidRows=True
+            if invalidRows:
+                return tokens,False,'INVALID_INDEXER_TOKEN_ROWS'
             newPage=payload.get('pageKey')
+            if newPage is not None and not isinstance(newPage,str):
+                return tokens,False,'INVALID_INDEXER_CURSOR'
             if not newPage:
                 return tokens,True,'complete'
             if newPage in seen:
@@ -269,9 +280,15 @@ async def indexedCandidates(session, url, wallet):
                 if response.status!=200:
                     raise RuntimeError('BLOCKSCOUT_HTTP_'+str(response.status))
                 data=await response.json()
+            if not isinstance(data,dict) or not isinstance(data.get('items'),list):
+                raise RuntimeError('BLOCKSCOUT_INVALID_RESPONSE')
             for item in data['items']:
+                if not isinstance(item,dict) or not isinstance(item.get('token'),dict):
+                    raise RuntimeError('BLOCKSCOUT_INVALID_TOKEN_ROW')
                 tokens.add(tokenAddress(item['token']['address_hash']))
             nextParams=data.get('next_page_params')
+            if nextParams is not None and not isinstance(nextParams,dict):
+                raise RuntimeError('BLOCKSCOUT_INVALID_CURSOR')
             if not nextParams:
                 evidence['blockscoutPagesComplete']=True
                 break
@@ -282,7 +299,8 @@ async def indexedCandidates(session, url, wallet):
         else:
             raise RuntimeError('BLOCKSCOUT_PAGE_LIMIT')
     except (RuntimeError,ValueError,KeyError,TypeError,aiohttp.ClientError,asyncio.TimeoutError) as error:
-        evidence['blockscoutReason']=type(error).__name__
+        evidence['blockscoutPagesComplete']=False
+        evidence['blockscoutReason']=str(error) if isinstance(error,RuntimeError) else type(error).__name__
     return tokens,evidence
 
 
@@ -294,6 +312,8 @@ async def inventory(rpc, session, url, wallet, dataDir, store, extras):
     tokens.update((WETH,USDG))
     tokens.discard(NATIVE)
     block=await rpc.call('eth_getBlockByNumber',['latest',False])
+    if not isinstance(block,dict) or not block.get('number') or not block.get('hash'):
+        raise RuntimeError('INVENTORY_BLOCK_UNAVAILABLE')
     balances={}
     for token in sorted(tokens):
         try:
@@ -305,39 +325,59 @@ async def inventory(rpc, session, url, wallet, dataDir, store, extras):
     return balances,evidence
 
 
-async def discoverVenues(rpc, token, existing):
-    """Bounded discovery against canonical factory and authenticated pool logs."""
+async def discoverVenues(rpc, token, existing, issues=None):
+    """Discover pools with bounded calls and preserve every successful result."""
     import detector
     from eth_abi import decode
+    from eth_abi.exceptions import DecodingError
     found={venue['id']:venue for venue in existing}
-    for base in (WETH,USDG):
-        for fee in (100,500,3000,10000):
-            try:
-                raw=await rpc.ethCall(detector.V3_FACTORY,calldata('getPool(address,address,uint24)',['address','address','uint24'],[token,base,fee]),'latest')
-                pool=decode(['address'],bytes.fromhex(raw[2:]))[0].lower()
-                if pool!=NATIVE:
-                    t0,t1=sorted((token,base))
-                    found[pool]=dict(id=pool,source='uniswapV3',token0=t0,token1=t1,fee=fee)
-            except (RuntimeError,ValueError):
-                continue
-    # Currency addresses are indexed in Initialize, enabling targeted discovery.
-    # A provider that refuses the historical range leaves an explicit gap, with
-    # no unbounded chain scan or repeated range splitting.
+    issues=issues if issues is not None else []
+    semaphore=asyncio.Semaphore(4)
+
+    async def v3Pool(base, fee):
+        try:
+            async with semaphore:
+                raw=await asyncio.wait_for(rpc.ethCall(detector.V3_FACTORY,calldata('getPool(address,address,uint24)',['address','address','uint24'],[token,base,fee]),'latest'),timeout=3)
+            pool=decode(['address'],bytes.fromhex(raw[2:]))[0].lower()
+            if pool!=NATIVE:
+                t0,t1=sorted((token,base))
+                found[pool]=dict(id=pool,source='uniswapV3',token0=t0,token1=t1,fee=fee)
+        except (RuntimeError,ValueError,TypeError,DecodingError,asyncio.TimeoutError):
+            issues.append('V3_LOOKUP_FAILED')
+
+    await asyncio.gather(*(v3Pool(base,fee) for base in (WETH,USDG) for fee in (100,500,3000,10000)))
     topic='0x'+token[2:].rjust(64,'0')
     spec=detector.SOURCES['uniswapV4']
-    for topics in ([spec['topic'],None,topic],[spec['topic'],None,None,topic]):
+
+    async def v4Pools(topics):
         try:
-            logs=await rpc.call('eth_getLogs',[dict(address=spec['address'],fromBlock='0x0',toBlock='latest',topics=topics)])
+            logs=await asyncio.wait_for(rpc.call('eth_getLogs',[dict(address=spec['address'],fromBlock='0x0',toBlock='latest',topics=topics)]),timeout=5)
+            if not isinstance(logs,list):
+                raise ValueError('Invalid pool logs')
             for raw in logs:
+                if not isinstance(raw,dict):
+                    raise ValueError('Invalid pool log')
                 if raw.get('removed') or raw.get('address','').lower()!=spec['address']:
                     continue
                 event=detector.decodeLog(raw,recovered=True)
                 for held,venue in peak.launchVenues(event):
                     if held==token:
                         found[venue['id']]=venue
-        except (RuntimeError,ValueError,KeyError,TypeError):
-            continue
+        except (RuntimeError,ValueError,KeyError,TypeError,asyncio.TimeoutError):
+            issues.append('V4_HISTORY_UNAVAILABLE')
+
+    await asyncio.gather(v4Pools([spec['topic'],None,topic]),v4Pools([spec['topic'],None,None,topic]))
     return list(found.values())
+
+
+async def closingInventory(rpc,session,url,wallet,dataDir,store,extras):
+    try:
+        balances,evidence=await inventory(rpc,session,url,wallet,dataDir,store,extras)
+        if not evidence.get('alchemyPagesComplete') and not evidence.get('blockscoutPagesComplete'):
+            evidence['coverage']='CLOSING_INVENTORY_FAILED'
+        return balances,evidence
+    except (RuntimeError,ValueError,KeyError,TypeError,aiohttp.ClientError,asyncio.TimeoutError) as error:
+        return {}, {'coverage':'CLOSING_INVENTORY_FAILED','reason':type(error).__name__}
 
 
 async def feePrice(rpc):
@@ -350,10 +390,10 @@ async def receiptIncome(rpc, receipt, token, wallet):
     """Return actual debit and attributable output. Unknown native payout stays unknown."""
     from live_executor import receiptTransfers
     block=await rpc.call('eth_getBlockByNumber',[receipt['blockNumber'],False])
-    if block['hash'].lower()!=receipt['blockHash'].lower():
+    if not isinstance(block,dict) or not isinstance(block.get('hash'),str) or block['hash'].lower()!=receipt['blockHash'].lower():
         raise RuntimeError('RECEIPT_REORG')
     tx=await rpc.call('eth_getTransactionByHash',[receipt['transactionHash']])
-    if tx['from'].lower()!=wallet.lower() or tx['blockHash'].lower()!=receipt['blockHash'].lower():
+    if not isinstance(tx,dict) or str(tx.get('from','')).lower()!=wallet.lower() or str(tx.get('blockHash','')).lower()!=receipt['blockHash'].lower():
         raise RuntimeError('RECEIPT_IDENTITY_UNVERIFIED')
     debit=-receiptTransfers(receipt,token,wallet)
     weth=receiptTransfers(receipt,WETH,wallet)
@@ -367,6 +407,8 @@ async def receiptIncome(rpc, receipt, token, wallet):
         credit=0
         def walk(call):
             nonlocal credit
+            if not isinstance(call,dict):
+                raise ValueError('INVALID_TRACE_RESPONSE')
             if call.get('error'):
                 return
             value=int(call.get('value','0x0'),16)
@@ -395,10 +437,15 @@ async def accountReceipts(rpc,store,wallet):
             continue
         if int(receipt['status'],16)==0:
             continue
-        debit,income=await receiptIncome(rpc,receipt,row['selectionId'],wallet)
+        accountingReason=None
+        try:
+            debit,income=await receiptIncome(rpc,receipt,row['selectionId'],wallet)
+        except (RuntimeError,ValueError,KeyError,TypeError,aiohttp.ClientError,asyncio.TimeoutError) as error:
+            debit,income=0,None
+            accountingReason=type(error).__name__
         fills=[fill for fill in fills if fill['txHash']!=row['txHash']]
         fxData=json.loads(store.get('manualFx:'+row['intentId'],'{}'))
-        fills.append({'txHash':row['txHash'],'debited':str(debit),'income':income,'gasWei':str(txFee(receipt)),**fxData})
+        fills.append({'txHash':row['txHash'],'debited':str(debit),'income':income,'gasWei':str(txFee(receipt)),'accountingReason':accountingReason,**fxData})
         saveResult(store,row['selectionId'],fills=fills,state='MINED_ACCOUNTING_PENDING' if debit<=0 or not income else 'SALE_CONFIRMED')
 
 
@@ -517,7 +564,7 @@ def writeReport(store,runDir):
     # for exact attribution, so publish raw gas and a labelled current-rate estimate.
     report['netGbpEstimate']=str(gbp-Decimal(report['gasWei'])*rates[-1]/WEI) if rates and complete else None
     report['walletClear']=False
-    report['clearanceReason']='INDEX_WATERMARK_UNVERIFIED; inspect remaining balances'
+    report['clearanceReason']=report['closingInventory'].get('coverage','INDEX_WATERMARK_UNVERIFIED')+'; inspect remaining balances'
     (runDir/'report.json').write_text(json.dumps(report,indent=2)+'\n')
     print('RUN',runDir.name,'WALLET',report['wallet'],flush=True)
     print('PROCEEDS RAW',report['proceedsRawByAsset'],'GROSS GBP VALUED',report['grossGbpValuedSubtotal'],'GAS WEI',report['gasWei'],'NET GBP ESTIMATE',report['netGbpEstimate'],flush=True)
@@ -590,12 +637,13 @@ async def run(args):
                         continue
                     if not venues.get(token):
                         try:
-                            venues[token]=await asyncio.wait_for(discoverVenues(rpc,token,[]),timeout=20)
+                            discoveryIssues=[]
+                            venues[token]=await discoverVenues(rpc,token,[],discoveryIssues)
                         except asyncio.TimeoutError:
                             saveResult(store,token,state='POOL_DISCOVERY_TIMEOUT',remainingRaw=str(amount))
                             continue
                     if not venues.get(token):
-                        saveResult(store,token,state='NO_KNOWN_POOL',remainingRaw=str(amount))
+                        saveResult(store,token,state='NO_KNOWN_POOL',remainingRaw=str(amount),reason=','.join(sorted(set(discoveryIssues))) or 'NO_SUPPORTED_POOL_FOUND')
                         continue
                     try:
                         if args.command=='preview':
@@ -607,19 +655,21 @@ async def run(args):
                         else:
                             await asyncio.wait_for(sellHolding(rpc,adapter,journal,store,wallet,token,fx),timeout=60)
                     except (RuntimeError,ValueError,KeyError,StopIteration,asyncio.TimeoutError) as error:
-                        saveResult(store,token,state='DEFERRED',reason=(str(error) or type(error).__name__)[:180])
+                        saveResult(store,token,state='DEFERRED',remainingRaw=str(amount),reason=(str(error) or type(error).__name__)[:180])
                         if journal and journal.unsettled():
                             raise RuntimeError('PENDING_TRANSACTION_PRESERVED') from error
-                closing,closingEvidence=await inventory(rpc,session,url,wallet,args.data_dir.expanduser().resolve(),store,args.token)
+                closing,closingEvidence=await closingInventory(rpc,session,url,wallet,args.data_dir.expanduser().resolve(),store,args.token)
                 for token,amount in closing.items():
                     saveResult(store,token,remainingRaw=str(amount) if amount is not None else None)
                 store.set('closingInventory',json.dumps(closingEvidence))
                 if args.command=='execute':
                     pendingAccounting=any(any(not fill.get('income') or int(fill.get('debited','0'))<=0 for fill in json.loads(row[0]).get('fills',[])) for row in store.db.execute('SELECT payload FROM manual_results'))
-                    if not pendingAccounting:
+                    if not pendingAccounting and closingEvidence.get('coverage')!='CLOSING_INVENTORY_FAILED':
                         active.unlink(missing_ok=True)
                     (root/'latest-run').write_text(runDir.name)
             finally:
+                if args.command=='execute':
+                    (root/'latest-run').write_text(runDir.name)
                 writeReport(store,runDir)
                 store.db.close()
 

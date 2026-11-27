@@ -8,3 +8,11 @@
 - Current scope uses the operator's 2p gross quote cutoff. Separate fee profitability or aggregate gas budgets were removed following the user's clarification.
 - Provider wallet coverage, router deployment bytecode, current wallet identity, actual quotes and actual transactions have not been verified live in this workspace. No mainnet transactions were submitted.
 - Explicit limitations are documented in MANUAL_SALE_README.md, including unavailable native traces, unverifiable index watermarks, provider refusal of historical v4 pool discovery and simulation failures after a successful full-size quote.
+
+## Build two repair
+
+- Reproduced HTTP 429 with JSON null, null RPC results and malformed token rows. Added index response validation and explicit incomplete coverage.
+- Added closing-inventory failure recovery with a full execute/resume regression. No transaction signing occurs in that fixture.
+- Bounded concurrent pool lookup preserves discovered venues through failed v4 history. Empty ABI responses are local discovery failures.
+- Null receipt evidence remains accounting-pending. Existing 2p cutoff and current Alchemy config are retained.
+- Targeted manual tests pass, 20 tests. Full repository suite passes, 403 tests in 12.311 seconds. Live provider and wallet validation remain pending.

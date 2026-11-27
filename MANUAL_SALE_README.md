@@ -4,20 +4,22 @@ Run between campaigns. The command reads the configured main keystore's public a
 
 ## Install once
 
-Extract the complete archive to `~/blackswan-manual-sale`, then run these commands independently.
+Clone the `manual-wallet-sale/build-two` Git branch into `~/blackswan-manual-sale-v2`, then run these commands independently.
 
 ```bash
-cd ~/blackswan-manual-sale
+cd ~/blackswan-manual-sale-v2
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt -r requirements_live.txt
 ```
 
 The defaults use `~/Desktop/wallet.json` and `~/.config/blackswan/concentration-new-alchemy.env`. Override `--wallet-file` or `--env` if your current main wallet uses different paths. The local keystore password is entered on your own computer.
 
+The existing run journal remains under the same per-wallet state directory. A fresh checkout resumes an interrupted run automatically. Null/malformed index responses preserve partial inventory and fall back to the other index. A failed closing scan saves a coverage failure and retains the active run for retry. Native receipt evidence that is unavailable stays accounting-pending. Pool discovery retains successful v3 results even when v4 history fails, and reports unavailable discovery sources.
+
 ## Preview
 
 ```bash
-~/blackswan-manual-sale/.venv/bin/python ~/blackswan-manual-sale/manual_wallet_sale.py preview --data-dir ~/blackswan-concentration-audit/data
+~/blackswan-manual-sale-v2/.venv/bin/python ~/blackswan-manual-sale-v2/manual_wallet_sale.py preview --data-dir ~/blackswan-concentration-audit/data
 ```
 
 ## Sell
@@ -25,7 +27,7 @@ The defaults use `~/Desktop/wallet.json` and `~/.config/blackswan/concentration-
 Stop campaigns using their ordinary controls, then run:
 
 ```bash
-~/blackswan-manual-sale/.venv/bin/python ~/blackswan-manual-sale/manual_wallet_sale.py execute --data-dir ~/blackswan-concentration-audit/data
+~/blackswan-manual-sale-v2/.venv/bin/python ~/blackswan-manual-sale-v2/manual_wallet_sale.py execute --data-dir ~/blackswan-concentration-audit/data
 ```
 
 The same command can be reused whenever you want. It resumes its outstanding run before creating another. A completed run followed by another invocation reads fresh balances. The full main wallet address appears in the report. Point `--data-dir` at the historical campaign data you actually have; the tool reads these databases without changing them. It also checks indexed wallet balances and discovers standard v3 pools and targeted v4 initialization logs.
@@ -33,7 +35,7 @@ The same command can be reused whenever you want. It resumes its outstanding run
 ## Reopen report
 
 ```bash
-~/blackswan-manual-sale/.venv/bin/python ~/blackswan-manual-sale/manual_wallet_sale.py report --data-dir ~/blackswan-concentration-audit/data
+~/blackswan-manual-sale-v2/.venv/bin/python ~/blackswan-manual-sale-v2/manual_wallet_sale.py report --data-dir ~/blackswan-concentration-audit/data
 ```
 
 Each run saves `report.json` and its durable execution journal under `~/.local/state/blackswan/manual-sales/WALLET/RUN/`. Keep these files. The journal contains signed transaction bytes and is private operator data. Use the same Linux user each time.

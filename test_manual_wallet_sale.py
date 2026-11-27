@@ -5,7 +5,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import Mock, AsyncMock, patch
 import manual_wallet_sale as manual
 
 TOKEN='0x'+'11'*20
@@ -107,6 +107,110 @@ class SweepTests(unittest.IsolatedAsyncioTestCase):
             debit,income=await manual.receiptIncome(rpc,receipt,TOKEN,WALLET)
         self.assertEqual(debit,20)
         self.assertIsNone(income)
+
+
+class FakeResponse:
+    def __init__(self, payload, status=200):
+        self.payload=payload
+        self.status=status
+    async def __aenter__(self):
+        return self
+    async def __aexit__(self, *args):
+        pass
+    async def json(self, **kwargs):
+        return self.payload
+
+
+class ProviderResponseTests(unittest.IsolatedAsyncioTestCase):
+    async def test_null_and_malformed_index_responses_preserve_partial_inventory(self):
+        first={'result':{'tokenBalances':[{'contractAddress':TOKEN,'tokenBalance':'0x1'}],'pageKey':'second'}}
+        for payload in (None, [], 'bad gateway', {'result':None}, {'result':[]}, {'result':{'tokenBalances':[None]}}):
+            with self.subTest(payload=payload):
+                session=type('Session',(),{'post':Mock(side_effect=[FakeResponse(first),FakeResponse(payload)])})()
+                tokens,complete,reason=await manual.indexedWalletTokens(session,'https://example.invalid',WALLET)
+                self.assertEqual(tokens,{TOKEN})
+                self.assertFalse(complete)
+                self.assertTrue(reason)
+
+    async def test_null_http_error_and_blockscout_fallback_do_not_crash(self):
+        session=type('Session',(),{
+            'post':Mock(return_value=FakeResponse(None,429)),
+            'get':Mock(return_value=FakeResponse({'items':[{'token':{'address_hash':TOKEN}}],'next_page_params':None}))})()
+        tokens,evidence=await manual.indexedCandidates(session,'https://example.invalid',WALLET)
+        self.assertEqual(tokens,{TOKEN})
+        self.assertFalse(evidence['alchemyPagesComplete'])
+        self.assertTrue(evidence['blockscoutPagesComplete'])
+
+    async def test_null_blockscout_response_is_reported(self):
+        session=type('Session',(),{
+            'get':Mock(return_value=FakeResponse(None))})()
+        with patch.object(manual,'indexedWalletTokens',AsyncMock(return_value=({TOKEN},False,'unavailable'))):
+            tokens,evidence=await manual.indexedCandidates(session,'https://example.invalid',WALLET)
+        self.assertEqual(tokens,{TOKEN})
+        self.assertIn('blockscoutReason',evidence)
+
+class SweepRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_failed_closing_scan_returns_reportable_status(self):
+        with patch.object(manual,'inventory',AsyncMock(side_effect=RuntimeError('RPC unavailable'))):
+            balances,evidence=await manual.closingInventory(None,None,None,WALLET,None,None,())
+        self.assertEqual(balances,{})
+        self.assertEqual(evidence['coverage'],'CLOSING_INVENTORY_FAILED')
+
+    async def test_failed_indexes_keep_run_recoverable(self):
+        with patch.object(manual,'inventory',AsyncMock(return_value=({TOKEN:1},{'alchemyPagesComplete':False,'blockscoutPagesComplete':False}))):
+            balances,evidence=await manual.closingInventory(None,None,None,WALLET,None,None,())
+        self.assertEqual(balances,{TOKEN:1})
+        self.assertEqual(evidence['coverage'],'CLOSING_INVENTORY_FAILED')
+
+    async def test_v3_pool_survives_refused_v4_history(self):
+        from eth_abi import encode
+        pool='0x3333333333333333333333333333333333333333'
+        rpc=type('Rpc',(),{'ethCall':AsyncMock(return_value='0x'+encode(['address'],[pool]).hex()),'call':AsyncMock(side_effect=RuntimeError('range refused'))})()
+        issues=[]
+        venues=await manual.discoverVenues(rpc,TOKEN,[],issues)
+        self.assertEqual(len(venues),1)
+        self.assertEqual(venues[0]['id'],pool)
+        self.assertIn('V4_HISTORY_UNAVAILABLE',issues)
+
+    async def test_current_mainnet_env_is_default(self):
+        import inspect
+        self.assertIn('.config/blackswan/concentration-new-alchemy.env',inspect.getsource(manual.main))
+
+class ReceiptNullTests(unittest.IsolatedAsyncioTestCase):
+    async def test_null_trace_preserves_verified_debit_without_claiming_proceeds(self):
+        receipt=dict(blockNumber='0x5',blockHash='0xabc',transactionHash='0xdef',logs=[])
+        rpc=type('Rpc',(),{'call':AsyncMock(side_effect=[{'hash':'0xabc'},{'from':WALLET,'blockHash':'0xabc'},None])})()
+        with patch('live_executor.receiptTransfers',return_value=-20):
+            debit,income=await manual.receiptIncome(rpc,receipt,TOKEN,WALLET)
+        self.assertEqual(debit,20)
+        self.assertIsNone(income)
+
+class FullRunRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_execute_closing_failure_resumes_same_run_without_signing(self):
+        from types import SimpleNamespace
+        import json
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            args=SimpleNamespace(command='execute',env=root/'env',wallet_file=root/'wallet',data_dir=root/'data',state_dir=root/'state',token=[])
+            rpc=SimpleNamespace(call=AsyncMock(return_value='0x1237'))
+            journal=SimpleNamespace(reconcile=AsyncMock(),unsettled=Mock(return_value=[]),create=AsyncMock())
+            good=({TOKEN:0},{'coverage':'INDEXED_WATERMARK_UNVERIFIED','alchemyPagesComplete':True})
+            with patch.object(manual.peak,'loadSettings',return_value=('https://example.invalid',WALLET)),patch.object(manual,'globalWalletLock',return_value=root/'lock'),patch.object(manual,'otherLiveExecutors',return_value=[]),patch.object(manual.peak,'Rpc',return_value=rpc),patch.object(manual,'ensurePriorNoncesResolved',AsyncMock()),patch.object(manual.getpass,'getpass',return_value='fixture'),patch.object(manual,'decodeKeystore',return_value=(SimpleNamespace(address=WALLET),None)),patch.object(manual,'TransactionJournal',return_value=journal),patch.object(manual,'accountReceipts',AsyncMock()),patch.object(manual,'freshRate',AsyncMock(return_value=Decimal('2000'))),patch.object(manual,'inventory',AsyncMock(side_effect=[good,RuntimeError('unavailable'),good,good])):
+                await manual.run(args)
+                walletRoot=args.state_dir/WALLET
+                active=(walletRoot/'active-run').read_text()
+                report=json.loads((walletRoot/active/'report.json').read_text())
+                self.assertEqual(report['closingInventory']['coverage'],'CLOSING_INVENTORY_FAILED')
+                await manual.run(args)
+                self.assertFalse((walletRoot/'active-run').exists())
+                self.assertEqual((walletRoot/'latest-run').read_text(),active)
+                journal.create.assert_not_awaited()
+
+    async def test_empty_abi_result_does_not_abort_pool_discovery(self):
+        rpc=type('Rpc',(),{'ethCall':AsyncMock(return_value='0x'),'call':AsyncMock(return_value=[])})()
+        issues=[]
+        self.assertEqual(await manual.discoverVenues(rpc,TOKEN,[],issues),[])
+        self.assertIn('V3_LOOKUP_FAILED',issues)
 
 if __name__=='__main__':
     unittest.main()
