@@ -9,6 +9,7 @@ from campaign_v3 import concentrationCampaign, validateCampaign
 from live_executor import ExecutionStore
 from sacrificial_lamb import LambGate
 from wallet_transactions import TransactionJournal
+from swap_adapters import boundEntryTransaction, calldata, abiTools, V3_ROUTER, V4_ROUTER
 from test_lamb_500_block_gate import TestProbe500BlockGate
 from test_sacrificial_lamb import WALLET
 from pathlib import Path
@@ -36,7 +37,11 @@ class CanonicalTimingTests(unittest.IsolatedAsyncioTestCase):
         c=self.case; previous=c.rpc.call
         async def rpc(method,params):
             if method=='eth_getBlockByNumber':
-                assert int(params[0],16)==block
+                number=int(params[0],16)
+                if number==10:
+                    window=json.loads(c.selection()['event'])['windowEndAtExclusive']
+                    return {'number':hex(10),'timestamp':hex(window+1),'hash':'0x'+'ab'*32}
+                assert number==block
                 return {'number':hex(block),'timestamp':hex(stamp),'hash':'0x'+'cc'*32}
             return await previous(method,params)
         c.rpc.call=rpc
@@ -127,5 +132,24 @@ class JournalDeadlineTests(unittest.IsolatedAsyncioTestCase):
             await self.journal.reconcile()
             self.assertEqual(send.await_count,1)
             self.assertTrue(self.journal.unsettled())
+
+class RouterExpiryTests(unittest.TestCase):
+    def test_v4_expiry_changes_only_deadline(self):
+        original=dict(to=V4_ROUTER,value=9,data=calldata('execute(bytes,bytes[],uint256)',
+            ['bytes','bytes[]','uint256'],[b'\\x10',[b'abc'],999]))
+        bound=boundEntryTransaction(original,103)
+        _,decode,_=abiTools()
+        self.assertEqual(decode(['bytes','bytes[]','uint256'],bytes.fromhex(bound['data'][10:])),(b'\\x10',(b'abc',),103))
+        self.assertEqual(bound['value'],original['value'])
+        self.assertNotEqual(bound['data'],original['data'])
+    def test_v3_deadline_multicall_preserves_exact_input_calldata(self):
+        signature='exactInputSingle((address,address,uint24,address,uint256,uint256,uint160))'
+        original=dict(to=V3_ROUTER,value=9,data=calldata(signature,
+            ['(address,address,uint24,address,uint256,uint256,uint160)'],
+            [('0x'+'1'*40,'0x'+'2'*40,100,WALLET,9,1,0)]))
+        bound=boundEntryTransaction(original,103)
+        _,decode,_=abiTools()
+        self.assertEqual(decode(['uint256','bytes[]'],bytes.fromhex(bound['data'][10:])),(103,(bytes.fromhex(original['data'][2:]),)))
+        self.assertEqual(bound['value'],original['value'])
 
 if __name__=='__main__':unittest.main()

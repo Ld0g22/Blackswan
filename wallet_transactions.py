@@ -5,6 +5,7 @@ broadcast is retried with the identical signed bytes, and receipts are authorita
 """
 import asyncio
 import json
+import math
 import time
 from pathlib import Path
 
@@ -62,7 +63,17 @@ class TransactionJournal:
     def unsettled(self):
         return self.store.db.execute("SELECT * FROM transactions WHERE state IN ('SIGNED','SENT','UNCERTAIN','REJECTED','STUCK') ORDER BY createdAt").fetchall()
 
-    async def create(self, intentId, selectionId, kind, transaction, inputAmount=0):
+    def entryDeadline(self,intentId):
+        # Existing ledgers already have the meta table. No schema migration.
+        row=self.store.db.execute("SELECT value FROM meta WHERE key=?",('entryDeadline:'+intentId,)).fetchone()
+        return float(row[0]) if row else None
+
+    @staticmethod
+    def requireDeadline(deadlineAt):
+        if deadlineAt is not None and (not math.isfinite(deadlineAt) or time.time()>deadlineAt):
+            raise RuntimeError('MISSED_ENTRY_SIGNING_DEADLINE')
+
+    async def create(self, intentId, selectionId, kind, transaction, inputAmount=0, *, deadlineAt=None):
         """Return existing intent unchanged on replay. Only one in-flight transaction.
 
         A FAILED transaction may be retried by the caller with a fresh attempt ID;
@@ -72,6 +83,9 @@ class TransactionJournal:
             existing = self.store.db.execute('SELECT * FROM transactions WHERE intentId=?',(intentId,)).fetchone()
             if existing:
                 return dict(existing)
+            if deadlineAt is not None and kind not in ('BUY','PROBE_BUY'):
+                raise ValueError('DEADLINE_ONLY_FOR_ENTRY')
+            self.requireDeadline(deadlineAt)
             if self.unsettled():
                 raise RuntimeError('WALLET_TRANSACTION_IN_FLIGHT')
             chainId = int(await self.rpcCall('eth_chainId', []), 16)
@@ -110,17 +124,28 @@ class TransactionJournal:
             # Keep RPC calls as-is; checksum the exact same 20 bytes for signing.
             from eth_utils import to_checksum_address
             tx['to'] = to_checksum_address(tx['to'])
+            self.requireDeadline(deadlineAt)
             signed = self.account.sign_transaction(tx)
             raw = getattr(signed,'raw_transaction',None)
             if raw is None:  # Support only explicitly verified SDK attributes.
                 raise RuntimeError('eth-account API probe failed: raw_transaction missing')
             txHash = '0x'+bytes(signed.hash).hex()
             rawHex = '0x'+bytes(raw).hex()
-            with self.store.db:
-                self.store.db.execute('''INSERT INTO transactions
-                    (intentId,selectionId,kind,state,txHash,raw,nonce,createdAt,lastBroadcast,
-                    inputAmount,receipt,reason) VALUES(?,?,?,?,?,?,?,?,?,?,NULL,NULL)''',
-                    (intentId,selectionId,kind,'SIGNED',txHash,rawHex,nonce,time.time(),0.0,str(inputAmount)))
+            self.requireDeadline(deadlineAt)
+            if deadlineAt is not None:
+                self.store.db.execute('BEGIN IMMEDIATE')
+            try:
+                with self.store.db:
+                    self.store.db.execute('''INSERT INTO transactions
+                        (intentId,selectionId,kind,state,txHash,raw,nonce,createdAt,lastBroadcast,
+                        inputAmount,receipt,reason) VALUES(?,?,?,?,?,?,?,?,?,?,NULL,NULL)''',
+                        (intentId,selectionId,kind,'SIGNED',txHash,rawHex,nonce,time.time(),0.0,str(inputAmount)))
+                    if deadlineAt is not None:
+                        self.store.db.execute("INSERT INTO meta(key,value) VALUES(?,?)",
+                                              ('entryDeadline:'+intentId,str(deadlineAt)))
+            except BaseException:
+                if deadlineAt is not None and self.store.db.in_transaction:self.store.db.rollback()
+                raise
             return dict(self.store.db.execute('SELECT * FROM transactions WHERE intentId=?',(intentId,)).fetchone())
 
     async def broadcast(self, intentId):
@@ -135,6 +160,24 @@ class TransactionJournal:
         if not row or row['state'] not in ('SIGNED','SENT','UNCERTAIN'):
             return None
         now=time.time()
+        deadline=self.entryDeadline(intentId) if row['kind'] in ('BUY','PROBE_BUY') else None
+        if deadline is not None:
+            if now>deadline:
+                if row['state']=='SIGNED' and not row['lastBroadcast']:
+                    self.store.db.execute("UPDATE transactions SET state='EXPIRED_UNSENT',reason='ENTRY_DEADLINE_EXPIRED_BEFORE_SUBMISSION' WHERE intentId=?",(intentId,))
+                    return 'EXPIRED_UNSENT'
+                # Do not retransmit stale entries; keep possible submission reconcilable.
+                return row['state']
+            # Record the attempt BEFORE the external side effect. A crash here
+            # may be uncertain but can never be mistaken for definitely unsent.
+            self.store.db.execute("UPDATE transactions SET state='UNCERTAIN',lastBroadcast=?,reason='SUBMISSION_ATTEMPT_STARTED' WHERE intentId=?",(now,intentId))
+            if time.time()>deadline:
+                # No external call occurred in this invocation. Prior attempts,
+                # if any, must remain reconcilable.
+                if row['state']=='SIGNED' and not row['lastBroadcast']:
+                    self.store.db.execute("UPDATE transactions SET state='EXPIRED_UNSENT',reason='ENTRY_DEADLINE_EXPIRED_BEFORE_SUBMISSION' WHERE intentId=?",(intentId,))
+                    return 'EXPIRED_UNSENT'
+                return 'UNCERTAIN'
         try:
             returned=await sendRaw(self.rpc,row['raw'])
             if returned.lower()!=row['txHash'].lower():
@@ -176,6 +219,10 @@ class TransactionJournal:
                 self.store.db.execute('''UPDATE transactions SET state=?,receipt=?,reason=?
                     WHERE intentId=?''',(state,json.dumps(receipt),None if state=='CONFIRMED' else 'receipt status 0',row['intentId']))
                 completed.append(row['intentId'])
+            elif (row['kind'] in ('BUY','PROBE_BUY') and row['state']=='SIGNED'
+                  and not row['lastBroadcast'] and self.entryDeadline(row['intentId']) is not None
+                  and time.time()>self.entryDeadline(row['intentId'])):
+                await self.broadcast(row['intentId'])
             elif now-row['createdAt']>120:
                 # An old swap cannot safely be resurrected indefinitely: leave
                 # its nonce unresolved until a human checks chain/mempool state.
