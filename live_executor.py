@@ -29,6 +29,8 @@ from campaign_config import (FLEX_KIND, FLEX_POLICY, PILOT_KIND, PILOT_POLICY,
     globalWalletLock, otherLiveExecutors)
 from campaign_finance import CampaignFinance
 from campaign_v3 import validateCampaign, campaignDigest
+from entry_timing import canonicalTiming, windowEnd, entryKwargs
+from swap_adapters import boundEntryTransaction
 
 PURCHASES=20
 BUY_GBP=Decimal('0.10')
@@ -741,9 +743,15 @@ class LiveExecutor:
                                   (status,reason,selectionId))
             print('EXECUTION BUY EXCLUDED',status,reason,token,flush=True)
             return
-        deadlineStart=row['decisionAt']
+        try:deadlineStart=windowEnd(self.store,row)
+        except (ValueError,TypeError,KeyError):
+            self.store.db.execute("UPDATE selections SET status='SKIPPED',reason='INVALID_CANONICAL_WINDOW_EVIDENCE' WHERE selectionId=? AND status='QUEUED'",(selectionId,))
+            return
         if lamb is not None:
             deadlineStart=lamb.readyAt(selectionId)
+            if deadlineStart is None and canonicalTiming(self.store):
+                self.store.db.execute("UPDATE selections SET status='SKIPPED',reason='MISSING_CANONICAL_SURVIVAL_ANCHOR' WHERE selectionId=? AND status='QUEUED'",(selectionId,))
+                return
             if (deadlineStart is None or row['status']!='QUEUED' or
                     self.store.get('intakeState','OPEN')!='OPEN'):
                 return
@@ -815,12 +823,17 @@ class LiveExecutor:
                         "UPDATE selections SET status='SKIPPED',reason='MAIN_BUDGET_LIMIT' WHERE selectionId=? AND status='QUEUED'",
                         (selectionId,))
                     return
-                signed=await self.tx.create('buy:'+selectionId,selectionId,'BUY',transaction,amountWei)
+                kwargs=entryKwargs(self.store,deadlineStart,self.store.entryDeadlineSeconds)
+                if kwargs:transaction=boundEntryTransaction(transaction,kwargs['deadlineAt'])
+                signed=await self.tx.create('buy:'+selectionId,selectionId,'BUY',transaction,amountWei,**kwargs)
                 self.store.db.execute("UPDATE selections SET status='BUY_PENDING',quoteWei=? WHERE selectionId=?",
                                       (str(quote['output']),selectionId))
                 state=signed['state']
                 if state in ('SIGNED','SENT','UNCERTAIN'):
                     state=await self.tx.broadcast(signed['intentId'])
+            if state=='EXPIRED_UNSENT':
+                self.store.db.execute("UPDATE selections SET status='SKIPPED',reason='MISSED_ENTRY_DEADLINE' WHERE selectionId=?",(selectionId,))
+                return
             if state=='SENT':
                 print('BUY ACCEPTED_BY_RPC',token,signed['txHash'],flush=True)
             else:
@@ -856,14 +869,21 @@ class LiveExecutor:
         # status. Any signed/confirmed buy is still a real purchase candidate.
         self.store.db.execute('''UPDATE selections SET status='BUY_PENDING'
           WHERE status IN ('QUEUED','SKIPPED') AND selectionId IN
-          (SELECT selectionId FROM transactions WHERE kind='BUY')''')
+          (SELECT selectionId FROM transactions WHERE kind='BUY' AND state!='EXPIRED_UNSENT')''')
         lamb=getattr(self,'lamb',None)
         if lamb is not None:
             self.store.db.execute("""UPDATE selections SET status='PROBE_PENDING'
                 WHERE status='LAMB_QUEUED' AND selectionId IN
-                (SELECT selectionId FROM transactions WHERE kind='PROBE_BUY')""")
+                (SELECT selectionId FROM transactions WHERE kind='PROBE_BUY' AND state!='EXPIRED_UNSENT')""")
         await self.tx.reconcile()
         async with (self.intakeLock if lamb is not None else nullcontext()):
+            if canonicalTiming(self.store):
+                self.store.db.execute("""UPDATE selections SET status='SKIPPED',reason='MISSED_ENTRY_DEADLINE'
+                    WHERE status IN ('QUEUED','BUY_PENDING') AND selectionId IN
+                    (SELECT selectionId FROM transactions WHERE kind='BUY' AND state='EXPIRED_UNSENT')""")
+                self.store.db.execute("""UPDATE selections SET status='PROBE_FAILED',reason='MISSED_1P_DEADLINE'
+                    WHERE status IN ('LAMB_QUEUED','PROBE_PENDING') AND selectionId IN
+                    (SELECT selectionId FROM transactions WHERE kind='PROBE_BUY' AND state='EXPIRED_UNSENT')""")
             for row in self.store.db.execute("SELECT * FROM transactions WHERE state IN ('CONFIRMED','REVERTED') AND reason IS NULL OR state='REVERTED' AND reason='receipt status 0'"):
                 # Only settle once; a non-null SETTLED marker is durable.
                 if lamb is not None and row['kind']=='PROBE_BUY':

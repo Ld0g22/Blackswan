@@ -120,6 +120,33 @@ def buildV3(venue, tokenIn, amountIn, minOut, wallet, path=None):
     return {'to':V3_ROUTER,'data':data,'value':amountIn if tokenIn==NATIVE else 0}
 
 
+def boundEntryTransaction(transaction,deadlineAt):
+    """Preserve all swap bytes/amounts; give only new entries a chain expiry.
+    SwapRouter02's deadline multicall delegates to the original exact input.
+    Unknown router or selector fails closed; sales use the original builder.
+    """
+    encode,decode,keccak=abiTools()
+    deadline=int(deadlineAt)
+    tx=dict(transaction)
+    data=bytes.fromhex(tx['data'][2:])
+    if tx['to'].lower()==V4_ROUTER:
+        signature='execute(bytes,bytes[],uint256)'
+        if data[:4]!=keccak(text=signature)[:4]:
+            raise ValueError('INVALID_V4_ENTRY_SELECTOR')
+        commands,inputs,_=decode(['bytes','bytes[]','uint256'],data[4:])
+        tx['data']=calldata(signature,['bytes','bytes[]','uint256'],
+                            [commands,inputs,deadline])
+    elif tx['to'].lower()==V3_ROUTER:
+        selectors=[keccak(text=s)[:4] for s in
+            ('exactInput((bytes,address,uint256,uint256))',
+             'exactInputSingle((address,address,uint24,address,uint256,uint256,uint160))')]
+        if data[:4] not in selectors:raise ValueError('INVALID_V3_ENTRY_SELECTOR')
+        tx['data']=calldata('multicall(uint256,bytes[])',['uint256','bytes[]'],[deadline,[data]])
+    else:
+        raise ValueError('UNSUPPORTED_DEADLINE_ENTRY_ROUTER')
+    return tx
+
+
 def buildPons(venue, tokenIn, amountIn, minOut, wallet):
     if counterpart(venue['token0'],venue)!=NATIVE:
         raise ValueError('PONS_NON_NATIVE_QUOTE_REQUIRES_CONVERSION')

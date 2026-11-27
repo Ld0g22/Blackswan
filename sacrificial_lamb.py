@@ -9,6 +9,8 @@ import json
 import time
 
 from probe_buying_blocks import ProbeBuyingBlocks, MAX_BUYING_BLOCKS
+from entry_timing import canonicalTiming, windowEnd, targetKey, entryKwargs
+from swap_adapters import boundEntryTransaction
 
 PROBE_GBP=Decimal('0.01')
 TEN_PENNY_GBP=Decimal('0.10')
@@ -94,7 +96,7 @@ class LambGate:
         except (ValueError,TypeError,KeyError):
             self.state(selectionId,'PROBE_UNVERIFIED','PROBE_RECEIPT_EVIDENCE_MISSING')
             return None
-        target=receiptBlock+self.waitBlocks
+        target=receiptBlock+(self.waitBlocks or 0)
         try:
             head=await self.chainHead()
         except (RuntimeError,ValueError,TypeError,KeyError):
@@ -119,6 +121,41 @@ class LambGate:
         if not valid:
             self.state(selectionId,'PROBE_UNVERIFIED','PROBE_RECEIPT_REORG_OR_MISMATCH')
             return None
+        if canonicalTiming(self.store):
+            # Timestamp of the exact receipt/target blocks, never time of processing.
+            async def header(number):
+                h=await self.owner.rpc.call('eth_getBlockByNumber',[hex(number),False])
+                if (not isinstance(h,dict) or self.blockNumber(h.get('number'))!=number
+                        or not isinstance(h.get('hash'),str) or len(h['hash'])!=66):
+                    raise ValueError('INVALID_SURVIVAL_HEADER')
+                stamp=self.blockNumber(h.get('timestamp'))
+                if stamp<=0 or stamp>time.time():raise ValueError('INVALID_SURVIVAL_TIMESTAMP')
+                return h,stamp
+            try:
+                if target==receiptBlock:
+                    receiptHeader,receiptAt=await header(receiptBlock)
+                    targetAt=receiptAt+getattr(self.store,'probeWaitSeconds',WAIT_SECONDS)
+                else:
+                    ((receiptHeader,receiptAt),(_,targetAt))=await asyncio.gather(
+                        header(receiptBlock),header(target))
+                    if targetAt<receiptAt:raise ValueError('INVALID_SURVIVAL_TIMESTAMP_ORDER')
+                if receiptHeader['hash'].lower()!=original['blockHash'].lower():
+                    self.state(selectionId,'PROBE_UNVERIFIED','PROBE_RECEIPT_REORG_OR_MISMATCH')
+                    return None
+                selection=self.store.db.execute('SELECT * FROM selections WHERE selectionId=?',
+                                                (selectionId,)).fetchone()
+                anchor=windowEnd(self.store,selection)
+            except (RuntimeError,ValueError,TypeError,KeyError,AttributeError):
+                # Provider failure cannot create a fresh deadline.
+                return None
+            if not anchor<=receiptAt<=anchor+self.store.sacrificeDeadlineSeconds:
+                self.state(selectionId,'PROBE_FAILED','LATE_SACRIFICE_RECEIPT')
+                return None
+            if time.time()<targetAt:return None
+            if time.time()>targetAt+self.store.entryDeadlineSeconds:
+                self.state(selectionId,'PROBE_FAILED','MISSED_SURVIVAL_DEADLINE')
+                return None
+            self.store.set(targetKey(selectionId),targetAt)
         return target
 
 
@@ -130,7 +167,11 @@ class LambGate:
         r=self.row(selectionId)
         if self.activity is not None and self.activity.passed(selectionId) is None:
             return None
-        return float(r['passedAt']) if r and r['passedAt'] is not None else None
+        if not r or r['passedAt'] is None:return None
+        if canonicalTiming(self.store):
+            value=self.store.get(targetKey(selectionId),'')
+            return float(value) if value else None
+        return float(r['passedAt'])
 
     async def collectActivity(self,selection):
         """Read only the next mature 100-block range, without touching the signer."""
@@ -191,7 +232,12 @@ class LambGate:
         if reason:
             self.state(selectionId,'PROBE_FAILED',reason)
             return
-        if time.time()-selection['decisionAt']>getattr(self.store,'sacrificeDeadlineSeconds',PROBE_ENTRY_SECONDS):
+        try:anchor=windowEnd(self.store,selection)
+        except (ValueError,TypeError,KeyError):
+            self.state(selectionId,'PROBE_FAILED','INVALID_CANONICAL_WINDOW_EVIDENCE')
+            return
+        budget=getattr(self.store,'sacrificeDeadlineSeconds',PROBE_ENTRY_SECONDS)
+        if time.time()-anchor>budget:
             self.state(selectionId,'PROBE_FAILED','MISSED_1P_DEADLINE')
             return
         try:
@@ -199,11 +245,11 @@ class LambGate:
             amountWei=int((getattr(self.store,'probeGbp',PROBE_GBP)/rate*10**18).to_integral_value(rounding=ROUND_DOWN))
             if amountWei<=0:raise RuntimeError('ZERO_PROBE_VALUE')
             quote=(await self.owner.swaps.verifiedBuyCandidates(token,amountWei))[0]
-            if time.time()-selection['decisionAt']>getattr(self.store,'sacrificeDeadlineSeconds',PROBE_ENTRY_SECONDS):
+            if time.time()-anchor>budget:
                 raise RuntimeError('MISSED_1P_DEADLINE')
             origin=await self.owner.ponsOnChain(token)
             if origin:raise RuntimeError(origin)
-            if time.time()-selection['decisionAt']>getattr(self.store,'sacrificeDeadlineSeconds',PROBE_ENTRY_SECONDS):
+            if time.time()-anchor>budget:
                 raise RuntimeError('MISSED_1P_DEADLINE')
             async with self.owner.intakeLock:
                 fresh=self.store.db.execute('SELECT status FROM selections WHERE selectionId=?',
@@ -214,19 +260,23 @@ class LambGate:
                 if hasattr(self.store,"canSpend") and not self.store.canSpend("PROBE_BUY"):
                     self.state(selectionId,"PROBE_FAILED","SACRIFICE_BUDGET_LIMIT")
                     return
-                if time.time()-selection['decisionAt']>getattr(
-                        self.store,'sacrificeDeadlineSeconds',PROBE_ENTRY_SECONDS):
+                if time.time()-anchor>budget:
                     self.state(selectionId,'PROBE_FAILED','MISSED_1P_DEADLINE')
                     return
                 # A durable selection-derived intent is idempotent after restart.
+                transaction=self.owner.swaps.build(quote,amountWei,self.owner.tx.account.address)
+                kwargs=entryKwargs(self.store,anchor,budget)
+                if kwargs:transaction=boundEntryTransaction(transaction,kwargs['deadlineAt'])
                 signed=await self.owner.tx.create('lamb:'+selectionId,selectionId,'PROBE_BUY',
-                    self.owner.swaps.build(quote,amountWei,self.owner.tx.account.address),
-                    amountWei)
+                    transaction,amountWei,**kwargs)
                 self.store.db.execute(
                     "UPDATE selections SET status='PROBE_PENDING',quoteWei=? WHERE selectionId=?",
                     (str(quote['output']),selectionId))
                 if signed['state'] in ('SIGNED','SENT','UNCERTAIN'):
-                    await self.owner.tx.broadcast(signed['intentId'])
+                    state=await self.owner.tx.broadcast(signed['intentId'])
+                    if state=='EXPIRED_UNSENT':
+                        self.state(selectionId,'PROBE_FAILED','MISSED_1P_DEADLINE')
+                        return
                 print('LAMB 1P SENT',token,signed['txHash'],flush=True)
         except (RuntimeError,ValueError,KeyError,IndexError) as exc:
             reason=str(exc)
@@ -238,8 +288,7 @@ class LambGate:
             elif (getattr(self.store,'configuredCampaign',None) is not None and
                   not any(term in reason.upper() for term in (
                       'PONS_V2','WRONG_CHAIN','UNSUPPORTED','INVALID_SELECTION','BANNED')) and
-                  time.time()-selection['decisionAt']<getattr(
-                      self.store,'sacrificeDeadlineSeconds',PROBE_ENTRY_SECONDS)):
+                  time.time()-anchor<budget):
                 self.store.db.execute(
                     "UPDATE selections SET reason=? WHERE selectionId=? AND status='LAMB_QUEUED'",
                     (reason[:160],selectionId))
@@ -270,7 +319,7 @@ class LambGate:
         if qty<=0:
             self.state(selectionId,'PROBE_UNVERIFIED','NO_NET_PROBE_TOKEN_TRANSFER')
             return
-        if self.waitBlocks is not None:
+        if self.waitBlocks is not None or canonicalTiming(self.store):
             try:
                 self.blockNumber(receipt.get('blockNumber'))
                 if (self.blockNumber(receipt.get('status'))!=1
@@ -317,7 +366,7 @@ class LambGate:
                 and now-float(probe['lastCheck'])<3.0):
             return
         targetBlock=None
-        if self.waitBlocks is None:
+        if self.waitBlocks is None and not canonicalTiming(self.store):
             if now<float(probe['confirmedAt'])+getattr(self.store,'probeWaitSeconds',WAIT_SECONDS):
                 return
         else:
@@ -327,6 +376,11 @@ class LambGate:
                 return
             targetBlock=await self.blockGateReady(selectionId,probe)
             if targetBlock is None:return
+        if canonicalTiming(self.store):
+            anchor=float(self.store.get(targetKey(selectionId),'0'))
+            if not anchor or time.time()>anchor+self.store.entryDeadlineSeconds:
+                self.state(selectionId,'PROBE_FAILED','MISSED_SURVIVAL_DEADLINE')
+                return
         if self.store.get('intakeState','OPEN')!='OPEN':
             self.state(selectionId,'PROBE_FAILED','CAMPAIGN_CLOSED')
             return
@@ -380,6 +434,9 @@ class LambGate:
                     return
                 if not self.store.eligible():return
                 now=time.time()
+                if canonicalTiming(self.store) and now>anchor+self.store.entryDeadlineSeconds:
+                    self.state(selectionId,'PROBE_FAILED','MISSED_SURVIVAL_DEADLINE')
+                    return
                 self.store.db.execute('BEGIN IMMEDIATE')
                 try:
                     changed=self.store.db.execute(
@@ -402,6 +459,9 @@ class LambGate:
                    if getattr(self.store,'configuredCampaign',None) is not None
                    else any(x in reason.upper() for x in
                        ('NOT_SELLABLE','NO_TWO_WAY','ZERO_PROJECTED','PONS_V2','NO_SELL_ROUTE')))
+            if canonicalTiming(self.store) and time.time()>anchor+self.store.entryDeadlineSeconds:
+                fatal=True
+                reason='MISSED_SURVIVAL_DEADLINE'
             verdict='PROBE_FAILED' if fatal else 'PROBE_CONFIRMED'
             if fatal:
                 self.state(selectionId,verdict,reason)
