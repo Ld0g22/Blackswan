@@ -16,3 +16,10 @@
 - Bounded concurrent pool lookup preserves discovered venues through failed v4 history. Empty ABI responses are local discovery failures.
 - Null receipt evidence remains accounting-pending. Existing 2p cutoff and current Alchemy config are retained.
 - Targeted manual tests pass, 20 tests. Full repository suite passes, 403 tests in 12.311 seconds. Live provider and wallet validation remain pending.
+
+## Build three transport redesign
+
+- Replaced direct manual RPC calls with one paced, serialized session shared by inventory, signing dependencies, quote reads and signed broadcasts. Campaign RPC modules remain their existing source.
+- Regression coverage includes HTTP 429, JSON-RPC 429, null responses, 503 recovery, 20 concurrent reads, same-byte signed retransmission, deterministic revert without retry, bounded outage circuit, and no quantity reduction after throttling.
+- Targeted tests pass, 28 tests. Full repository suite passes, 411 tests in 12.518 seconds.
+- Live verification against the operator’s Alchemy account and liquid token remains pending.

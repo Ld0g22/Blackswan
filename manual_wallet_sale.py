@@ -19,6 +19,7 @@ import time
 import aiohttp
 
 import peak_tracker as peak
+from manual_rpc import ManualRpc, PacedSession, ProviderUnavailable, transientFailure
 from swap_adapters import SwapAdapters, calldata, NATIVE, WETH, USDG
 from wallet_transactions import TransactionJournal, decodeKeystore
 from live_executor import ExecutionStore
@@ -137,6 +138,8 @@ async def indexedWalletTokens(session, url, wallet):
                 return tokens,False,'repeated_page_cursor'
             seen.add(newPage)
             page=newPage
+        except ProviderUnavailable:
+            raise
         except (aiohttp.ClientError,asyncio.TimeoutError,ValueError,KeyError,TypeError) as exc:
             return tokens,False,'balance_index_error:'+type(exc).__name__
     return tokens,False,'balance_page_limit'
@@ -315,10 +318,13 @@ async def inventory(rpc, session, url, wallet, dataDir, store, extras):
     if not isinstance(block,dict) or not block.get('number') or not block.get('hash'):
         raise RuntimeError('INVENTORY_BLOCK_UNAVAILABLE')
     balances={}
+    print('Checking wallet balances ·',len(tokens),'token contracts',flush=True)
     for token in sorted(tokens):
         try:
             raw=await rpc.ethCall(token,calldata('balanceOf(address)',['address'],[wallet]),block['number'])
             balances[token]=int(raw,16)
+        except ProviderUnavailable:
+            raise
         except (RuntimeError,ValueError,TypeError):
             balances[token]=None
     evidence.update(block=block['number'],blockHash=block['hash'])
@@ -337,11 +343,13 @@ async def discoverVenues(rpc, token, existing, issues=None):
     async def v3Pool(base, fee):
         try:
             async with semaphore:
-                raw=await asyncio.wait_for(rpc.ethCall(detector.V3_FACTORY,calldata('getPool(address,address,uint24)',['address','address','uint24'],[token,base,fee]),'latest'),timeout=3)
+                raw=await rpc.ethCall(detector.V3_FACTORY,calldata('getPool(address,address,uint24)',['address','address','uint24'],[token,base,fee]),'latest')
             pool=decode(['address'],bytes.fromhex(raw[2:]))[0].lower()
             if pool!=NATIVE:
                 t0,t1=sorted((token,base))
                 found[pool]=dict(id=pool,source='uniswapV3',token0=t0,token1=t1,fee=fee)
+        except ProviderUnavailable:
+            raise
         except (RuntimeError,ValueError,TypeError,DecodingError,asyncio.TimeoutError):
             issues.append('V3_LOOKUP_FAILED')
 
@@ -351,7 +359,7 @@ async def discoverVenues(rpc, token, existing, issues=None):
 
     async def v4Pools(topics):
         try:
-            logs=await asyncio.wait_for(rpc.call('eth_getLogs',[dict(address=spec['address'],fromBlock='0x0',toBlock='latest',topics=topics)]),timeout=5)
+            logs=await rpc.call('eth_getLogs',[dict(address=spec['address'],fromBlock='0x0',toBlock='latest',topics=topics)])
             if not isinstance(logs,list):
                 raise ValueError('Invalid pool logs')
             for raw in logs:
@@ -363,6 +371,8 @@ async def discoverVenues(rpc, token, existing, issues=None):
                 for held,venue in peak.launchVenues(event):
                     if held==token:
                         found[venue['id']]=venue
+        except ProviderUnavailable:
+            raise
         except (RuntimeError,ValueError,KeyError,TypeError,asyncio.TimeoutError):
             issues.append('V4_HISTORY_UNAVAILABLE')
 
@@ -460,6 +470,8 @@ async def sendManual(journal,token,kind,tx,amount):
         journal.store.set('manualFx:'+intent,json.dumps({key:data[key] for key in ('fxGbpPerEth','fxAt')}))
     await journal.create(intent,token,kind,tx,amount)
     await journal.broadcast(intent)
+    if getattr(journal.rpc.session,'paused',False):
+        raise ProviderUnavailable('PROVIDER_PAUSED; signed transaction preserved')
     row=await awaitReceipt(journal,intent,seconds=45)
     if row['state'] not in ('CONFIRMED','REVERTED'):
         raise RuntimeError('PENDING_TRANSACTION_PRESERVED')
@@ -482,8 +494,9 @@ async def sellHolding(rpc,adapter,journal,store,wallet,token,fx):
                 quotes=[q for q in quotes if q['venue']['source'] in ('uniswapV3','uniswapV4') and int(q['output'])>0]
                 if quotes:
                     break
-            except (RuntimeError,ValueError):
-                pass
+            except (RuntimeError,ValueError) as error:
+                if transientFailure(error):
+                    raise ProviderUnavailable('PROVIDER_PAUSED during quotes') from error
             amount//=2
             if amount<=0:
                 break
@@ -542,6 +555,7 @@ def writeReport(store,runDir):
     rows=[json.loads(row[0]) for row in store.db.execute('SELECT payload FROM manual_results ORDER BY token')]
     report={'wallet':store.get('liquidationWallet'),'run':runDir.name,'inventory':json.loads(store.get('inventory','{}')),'closingInventory':json.loads(store.get('closingInventory','{}')),'tokens':rows,'gasWei':str(paidFees(store)),'unresolved':store.db.execute("SELECT txHash,state FROM transactions WHERE state IN ('SIGNED','SENT','UNCERTAIN','REJECTED','STUCK')").fetchall()}
     report['unresolved']=[dict(row) for row in report['unresolved']]
+    report['provider']=json.loads(store.get('providerStats','{}'))
     totals={}
     gbp=Decimal(0)
     complete=True
@@ -602,8 +616,9 @@ async def run(args):
                 raise RuntimeError('NO_PRIOR_REPORT')
             print((root/latest.read_text().strip()/'report.json').read_text())
             return
-        async with aiohttp.ClientSession() as session:
-            rpc=peak.Rpc(session,url,wallet)
+        async with aiohttp.ClientSession() as rawSession:
+            session=PacedSession(rawSession)
+            rpc=ManualRpc(session,url,wallet)
             fx=peak.Fx(session)
             journal=None
             try:
@@ -624,8 +639,12 @@ async def run(args):
                 balances,evidence=await inventory(rpc,session,url,wallet,args.data_dir.expanduser().resolve(),store,args.token)
                 store.set('inventory',json.dumps(evidence))
                 venues=loadKnownVenues(args.data_dir.expanduser().resolve(),set(balances))
+                cached=json.loads(store.get('manualVenues','{}'))
+                for token,known in cached.items():
+                    if token in venues:
+                        merged={v['id']:v for v in known+venues[token]}
+                        venues[token]=list(merged.values())
                 adapter=SwapAdapters(rpc,fx,VenueStore(venues))
-                rate=await freshRate(fx)
                 for token,amount in balances.items():
                     if token in (WETH,USDG):
                         saveResult(store,token,state='BASE_RETAINED',remainingRaw=str(amount))
@@ -639,6 +658,9 @@ async def run(args):
                         try:
                             discoveryIssues=[]
                             venues[token]=await discoverVenues(rpc,token,[],discoveryIssues)
+                            if venues[token]:
+                                cached[token]=venues[token]
+                                store.set('manualVenues',json.dumps(cached))
                         except asyncio.TimeoutError:
                             saveResult(store,token,state='POOL_DISCOVERY_TIMEOUT',remainingRaw=str(amount))
                             continue
@@ -647,14 +669,18 @@ async def run(args):
                         continue
                     try:
                         if args.command=='preview':
+                            rate=await freshRate(fx)
                             quote=(await adapter.directQuotes(token,amount,False))[0]
                             price=await feePrice(rpc)
                             approval=await adapter.approvalNeeded(quote,token,wallet,amount)
                             cap=(SALE_GAS_CAP+2*APPROVAL_GAS_CAP*int(approval is not None))*price
                             saveResult(store,token,state=salePolicy(quote['output'],rate),estimatedGbp=str(Decimal(quote['output'])*rate/WEI),remainingRaw=str(amount),maxGasGbp=str(Decimal(cap)*rate/WEI))
                         else:
-                            await asyncio.wait_for(sellHolding(rpc,adapter,journal,store,wallet,token,fx),timeout=60)
+                            await asyncio.wait_for(sellHolding(rpc,adapter,journal,store,wallet,token,fx),timeout=180)
                     except (RuntimeError,ValueError,KeyError,StopIteration,asyncio.TimeoutError) as error:
+                        if transientFailure(error):
+                            saveResult(store,token,state='PROVIDER_PAUSED',remainingRaw=str(amount),reason='Provider retry budget exhausted; same command resumes')
+                            raise ProviderUnavailable('PROVIDER_PAUSED; rerun same command to resume') from error
                         saveResult(store,token,state='DEFERRED',remainingRaw=str(amount),reason=(str(error) or type(error).__name__)[:180])
                         if journal and journal.unsettled():
                             raise RuntimeError('PENDING_TRANSACTION_PRESERVED') from error
@@ -668,6 +694,7 @@ async def run(args):
                         active.unlink(missing_ok=True)
                     (root/'latest-run').write_text(runDir.name)
             finally:
+                store.set('providerStats',json.dumps({'requests':session.requests,'retries':session.retries,'intervalSeconds':session.interval,'paused':session.paused}))
                 if args.command=='execute':
                     (root/'latest-run').write_text(runDir.name)
                 writeReport(store,runDir)

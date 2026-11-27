@@ -4,10 +4,10 @@ Run between campaigns. The command reads the configured main keystore's public a
 
 ## Install once
 
-Clone the `manual-wallet-sale/build-two` Git branch into `~/blackswan-manual-sale-v2`, then run these commands independently.
+Clone the `manual-wallet-sale/build-three` Git branch into `~/blackswan-manual-sale-v3`, then run these commands independently.
 
 ```bash
-cd ~/blackswan-manual-sale-v2
+cd ~/blackswan-manual-sale-v3
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt -r requirements_live.txt
 ```
@@ -19,7 +19,7 @@ The existing run journal remains under the same per-wallet state directory. A fr
 ## Preview
 
 ```bash
-~/blackswan-manual-sale-v2/.venv/bin/python ~/blackswan-manual-sale-v2/manual_wallet_sale.py preview --data-dir ~/blackswan-concentration-audit/data
+~/blackswan-manual-sale-v3/.venv/bin/python ~/blackswan-manual-sale-v3/manual_wallet_sale.py preview --data-dir ~/blackswan-concentration-audit/data
 ```
 
 ## Sell
@@ -27,7 +27,7 @@ The existing run journal remains under the same per-wallet state directory. A fr
 Stop campaigns using their ordinary controls, then run:
 
 ```bash
-~/blackswan-manual-sale-v2/.venv/bin/python ~/blackswan-manual-sale-v2/manual_wallet_sale.py execute --data-dir ~/blackswan-concentration-audit/data
+~/blackswan-manual-sale-v3/.venv/bin/python ~/blackswan-manual-sale-v3/manual_wallet_sale.py execute --data-dir ~/blackswan-concentration-audit/data
 ```
 
 The same command can be reused whenever you want. It resumes its outstanding run before creating another. A completed run followed by another invocation reads fresh balances. The full main wallet address appears in the report. Point `--data-dir` at the historical campaign data you actually have; the tool reads these databases without changing them. It also checks indexed wallet balances and discovers standard v3 pools and targeted v4 initialization logs.
@@ -35,7 +35,7 @@ The same command can be reused whenever you want. It resumes its outstanding run
 ## Reopen report
 
 ```bash
-~/blackswan-manual-sale-v2/.venv/bin/python ~/blackswan-manual-sale-v2/manual_wallet_sale.py report --data-dir ~/blackswan-concentration-audit/data
+~/blackswan-manual-sale-v3/.venv/bin/python ~/blackswan-manual-sale-v3/manual_wallet_sale.py report --data-dir ~/blackswan-concentration-audit/data
 ```
 
 Each run saves `report.json` and its durable execution journal under `~/.local/state/blackswan/manual-sales/WALLET/RUN/`. Keep these files. The journal contains signed transaction bytes and is private operator data. Use the same Linux user each time.
@@ -43,7 +43,7 @@ Each run saves `report.json` and its durable execution journal under `~/.local/s
 ## Behaviour and evidence
 
 - Fresh ETH/GBP rates are required for the 2p decision. A rate older than 60 seconds cannot authorize a sale. Slippage is 3% against a fresh exact-input quote, using the existing verified router encoders. Output settles to retained ETH or WETH, including supported USDG bridge routes.
-- Transactions are sequential. A token has at most nine quote sizes, eight successful chunks and 60 seconds of processing per pass. Unknown-pool discovery has a 20-second cap. A pending signed transaction pauses the run, retaining its exact intent and nonce. Restart reconciles it before any new sale.
+- Transactions are sequential. A token has at most nine quote sizes, eight successful chunks and 180 seconds of processing per pass. Unknown-pool discovery has bounded requests. A pending signed transaction pauses the run, retaining its exact intent and nonce. Restart reconciles it before any new sale.
 - Missing or illiquid routes, failed approvals, failed simulations, residual holdings and provider errors remain visible by full token address. Partial amounts are tried when the whole-size quote fails. A whole-size quote that later fails simulation is deferred for a future invocation.
 - Proceeds use confirmed receipt transfers for WETH. Native ETH proceeds need the provider's transaction call trace. If that trace is unavailable, the token debit and hash remain recorded with accounting pending. Repeating the execution command retries accounting and rereads holdings.
 - Gross GBP is valued using each sale attempt's timestamped ETH/GBP rate. Net GBP is labelled an estimate because the raw transaction fees are converted using the last available run rate. Exact raw proceeds and gas are always retained. Existing base balances are excluded from sale proceeds.
@@ -57,3 +57,9 @@ The archive is built from BlackSwan commit `12ae5070a8dea42ceda189ac6463763997b9
 ```bash
 .venv/bin/python -m unittest test_manual_wallet_sale -v
 ```
+
+## Provider pacing in build three
+
+All Alchemy POST requests use one serialized transport, including token inventory, contract calls, receipts and signed broadcasts. Initial spacing is 0.5 seconds and increases on throttling up to 4 seconds. Both HTTP 429 and JSON-RPC code 429 trigger shared cooldown. Each request has at most five attempts with exponential delays and Retry-After handling. Transient network failures and HTTP 408/500/502/503/504 use the same bounded recovery. Persistent failure pauses the whole run and preserves its journal. Rerun the same command after provider recovery. Retransmitted broadcasts contain identical signed bytes.
+
+Provider errors never trigger smaller-quantity quotes. Contract quote failures can still try bounded smaller quantities. Successful discovered pools are cached within the active run. Request/retry counts and final pacing appear in the JSON report. The current tool cannot prove live provider availability from offline tests.
