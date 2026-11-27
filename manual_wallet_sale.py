@@ -628,7 +628,7 @@ def main():
     parser=argparse.ArgumentParser(description='Reusable stopped-campaign wallet sale, gross quote at least 2p; retain base assets.')
     parser.add_argument('command',choices=['preview','execute','report'])
     parser.add_argument('--wallet-file',type=Path,default=Path.home()/'Desktop/wallet.json')
-    parser.add_argument('--env',type=Path,default=Path.home()/'blackswanRH_guarded/.env')
+    parser.add_argument('--env',type=Path,default=Path.home()/'.config/blackswan/concentration-new-alchemy.env')
     parser.add_argument('--data-dir',type=Path,required=True,help='Existing BlackSwan data folder containing historical pool records')
     parser.add_argument('--state-dir',type=Path,default=Path.home()/'.local/state/blackswan/manual-sales')
     parser.add_argument('--token',action='append',default=[])

@@ -12,7 +12,7 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt -r requirements_live.txt
 ```
 
-The defaults use `~/Desktop/wallet.json` and `~/blackswanRH_guarded/.env`. Override `--wallet-file` or `--env` if your current main wallet uses different paths. The local keystore password is entered on your own computer.
+The defaults use `~/Desktop/wallet.json` and `~/.config/blackswan/concentration-new-alchemy.env`. Override `--wallet-file` or `--env` if your current main wallet uses different paths. The local keystore password is entered on your own computer.
 
 ## Preview
 
