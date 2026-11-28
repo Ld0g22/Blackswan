@@ -29,9 +29,9 @@ from campaign_config import (FLEX_KIND, FLEX_POLICY, PILOT_KIND, PILOT_POLICY,
     globalWalletLock, otherLiveExecutors)
 from campaign_finance import CampaignFinance
 from campaign_v3 import validateCampaign, campaignDigest
-from entry_timing import (canonicalTiming, windowEnd, entryKwargs, PreparedEntry,
+from entry_timing import (canonicalTiming, cleanTiming, windowEnd, entryKwargs, PreparedEntry,
                           retryTime, recordFailure, parallelReads)
-from swap_adapters import boundEntryTransaction
+from swap_adapters import boundEntryTransaction, V3_ROUTER
 
 PURCHASES=20
 BUY_GBP=Decimal('0.10')
@@ -130,14 +130,14 @@ class ExecutionStore:
                                if self.configuredCampaign and
                                   self.configuredCampaign["sacrifice"]["wait"]["unit"]=="seconds"
                                else 10.0)
-        self.entryDeadlineSeconds=(self.configuredCampaign["execution"]["entryDeadlineSeconds"]
-                                   if self.configuredCampaign else BUY_LAG_LIMIT)
-        self.sacrificeDeadlineSeconds=(self.configuredCampaign["execution"]["sacrificeDeadlineSeconds"]
-                                       if self.configuredCampaign else 3.0)
+        self.entryDeadlineSeconds=(None if cleanTiming(self) else
+            self.configuredCampaign["execution"]["entryDeadlineSeconds"] if self.configuredCampaign else BUY_LAG_LIMIT)
+        self.sacrificeDeadlineSeconds=(None if cleanTiming(self) else
+            self.configuredCampaign["execution"]["sacrificeDeadlineSeconds"] if self.configuredCampaign else 3.0)
         if self.configuredCampaign:
             self.buyGbp=Decimal(self.configuredCampaign["main"]["stakeGbp"])
             self.purchaseLimit=self.configuredCampaign["main"]["maxPurchases"]
-            self.campaignKind="CONFIGURED_V3"
+            self.campaignKind="CONFIGURED_V"+str(self.configuredCampaign["schemaVersion"])
         path=Path(path)
         if self.configuredCampaign is not None and path.is_file() and path.stat().st_size:
             try:
@@ -145,7 +145,7 @@ class ExecutionStore:
                     recorded=dict(previous.execute('SELECT key,value FROM meta'))
             except sqlite3.Error as exc:
                 raise RuntimeError('CONFIGURED_V3_DB_UNREADABLE') from exc
-            if (recorded.get("campaignVersion")!="3" or
+            if (recorded.get("campaignVersion")!=str(self.configuredCampaign["schemaVersion"]) or
                     recorded.get("campaignIdentity")!=campaignDigest(self.configuredCampaign)):
                 raise RuntimeError("CONFIGURED_V3_CAMPAIGN_IDENTITY_MISMATCH")
         # Validate an existing file in READ-ONLY mode BEFORE any schema writes.
@@ -279,8 +279,8 @@ class ExecutionStore:
                 soldQty TEXT NOT NULL DEFAULT '0',
                 PRIMARY KEY(selectionId,stage))""")
             fields={
-                "campaignVersion": "3",
-                "campaignKind": "CONFIGURED_V3",
+                "campaignVersion": str(self.configuredCampaign["schemaVersion"]),
+                "campaignKind": self.campaignKind,
                 "campaignIdentity": campaignDigest(self.configuredCampaign),
                 "buyGbp": str(self.buyGbp),
                 "maxPurchases": str(self.purchaseLimit),
@@ -638,6 +638,9 @@ class LiveExecutor:
                     raise ValueError('Bad selector token key')
                 if self.store.db.execute('SELECT 1 FROM selections WHERE token=?',(token,)).fetchone() is None:
                     reason=self.entryExclusion(token,item)
+                    if cleanTiming(self.store) and (item.get("actionable") is False
+                            or float(item["decisionAt"])<getattr(self,"armedAt",0)):
+                        reason="PRE_ARM_OR_HISTORICAL_DECISION"
                     if reason=='V3_LAUNCH_EXCLUDED':
                         self.store.db.execute('''INSERT OR IGNORE INTO excluded_passes
                             (selectionId,token,decisionAt,source,reason)
@@ -732,6 +735,9 @@ class LiveExecutor:
         return None
 
     async def processEntry(self,row):
+        if cleanTiming(self.store):
+            await self.cleanEntry(row)
+            return
         if row['status']!='LAMB_QUEUED' and time.time()<float(self.store.get('buyRetryAfter:'+row['selectionId'],'0')):
             return
         if self.lamb is not None:
@@ -746,6 +752,113 @@ class LiveExecutor:
             if row and row['status']=='QUEUED':await self.buy(row,prepared=prepared)
         else:
             await self.buy(row)
+
+    async def cleanEntry(self,row):
+        """One configured entry path, independent of the selector policy.
+        No opportunity age gates; preserve the initiating failure.
+        """
+        selectionId,token,status=row['selectionId'],row['token'],row['status']
+        lamb=getattr(self,'lamb',None)
+        probe=status=='LAMB_QUEUED'
+        kind='PROBE_BUY' if probe else 'BUY'
+        if self.store.transactions(selectionId,kind):
+            self.store.db.execute("UPDATE selections SET status=? WHERE selectionId=?",
+                ('PROBE_PENDING' if probe else 'BUY_PENDING',selectionId))
+            return
+        def finish(reason):
+            current=self.store.db.execute('SELECT status FROM selections WHERE selectionId=?',(selectionId,)).fetchone()
+            if not current or current['status']!=status:return
+            if lamb is not None and (probe or status=='PROBE_CONFIRMED'):
+                lamb.state(selectionId,'PROBE_FAILED',reason)
+            else:
+                self.store.db.execute("UPDATE selections SET status='SKIPPED',reason=? WHERE selectionId=?",
+                                      (str(reason)[:160],selectionId))
+        if self.store.get('intakeState','OPEN')!='OPEN':return
+        if float(row['decisionAt'])<getattr(self,'armedAt',0):
+            finish('RESTART_UNSIGNED_ENTRY')
+            return
+        if self.selector.execute('SELECT 1 FROM revocations WHERE eventKey=? LIMIT 1',(selectionId,)).fetchone():
+            finish('SELECTOR_REVOKED')
+            return
+        if status not in ('LAMB_QUEUED','PROBE_CONFIRMED','QUEUED'):return
+        target=None
+        sacrifice=None
+        try:
+            reason=self.entryExclusion(token,json.loads(row['event']))
+            if reason:raise RuntimeError(reason)
+            if lamb is not None and not probe:
+                if status!='PROBE_CONFIRMED':raise RuntimeError('NO_CONFIRMED_SACRIFICE')
+                sacrifice=lamb.row(selectionId)
+                if not sacrifice:raise RuntimeError('PROBE_RECEIPT_EVIDENCE_MISSING')
+                target=await lamb.blockGateReady(selectionId,sacrifice)
+                if target is None:return
+                if lamb.activity is not None:
+                    _,_,receiptBlock=lamb.probeReceipt(selectionId,sacrifice)
+                    verdict,count=await lamb.activity.evaluate(row,receiptBlock)
+                    if verdict!='PASS':
+                        raise RuntimeError('PROBE_ACTIVITY_'+str(verdict))
+            if not self.store.canSpend(kind):raise RuntimeError('CAMPAIGN_SPEND_LIMIT')
+            if status!='QUEUED' and not self.store.eligible():
+                raise RuntimeError('MAIN_PURCHASE_LIMIT')
+            conflict=self.entryWalletConflict()
+            if conflict:raise RuntimeError(conflict)
+            rate=await self.fx.get()
+            stake=self.store.probeGbp if probe else self.store.buyGbp
+            amount=int((stake/rate*10**18).to_integral_value(rounding=ROUND_DOWN))
+            if amount<=0:raise RuntimeError('ZERO_STAKE_VALUE')
+            candidates,origin=await parallelReads(
+                self.swaps.verifiedBuyCandidates(token,amount),self.ponsOnChain(token))
+            if origin:raise RuntimeError(origin)
+            quote=candidates[0]
+            if int(quote['output'])<=0 or int(quote['preBuySellOutput'])<=0:
+                raise RuntimeError('NO_TWO_WAY_ENTRY_QUOTE')
+            if sacrifice is not None:
+                if min(lamb.blockNumber(quote['block']),lamb.blockNumber(quote['preBuySellBlock']))<target:
+                    raise RuntimeError('QUOTE_BEFORE_SURVIVAL_BLOCK')
+                sell=(await self.swaps.directQuotes(token,int(sacrifice['probeQty']),False,quote['block']))[0]
+                if int(sell['output'])<=0 or lamb.blockNumber(sell['block'])!=lamb.blockNumber(quote['block']):
+                    raise RuntimeError('SACRIFICE_SELLABILITY_NOT_VERIFIED')
+                if lamb.activity is not None and not await lamb.verifyActivityBeforeBuy(row):
+                    raise RuntimeError('PROBE_ACTIVITY_RECHECK_FAILED')
+            await self.submitCleanEntry(row,kind,amount,quote)
+        except (RuntimeError,ValueError,KeyError,TypeError,IndexError,ArithmeticError) as exc:
+            if self.store.transactions(selectionId,kind):
+                self.store.db.execute("UPDATE selections SET status=? WHERE selectionId=?",
+                    ('PROBE_PENDING' if probe else 'BUY_PENDING',selectionId))
+            else:finish(str(exc))
+            print('ENTRY FAILURE',kind,token,str(exc)[:160],flush=True)
+
+    async def submitCleanEntry(self,row,kind,amount,quote):
+        """Final authorisation under the existing transaction journal's sign lock."""
+        selectionId,token,status=row['selectionId'],row['token'],row['status']
+        probe=kind=='PROBE_BUY'
+        def beforeSign():
+            fresh=self.store.db.execute('SELECT status FROM selections WHERE selectionId=?',(selectionId,)).fetchone()
+            if not fresh or fresh['status']!=status or self.store.get('intakeState','OPEN')!='OPEN':
+                raise RuntimeError('ENTRY_NO_LONGER_AUTHORISED')
+            if self.selector.execute('SELECT 1 FROM revocations WHERE eventKey=? LIMIT 1',(selectionId,)).fetchone():
+                raise RuntimeError('SELECTOR_REVOKED')
+            reason=self.entryExclusion(token,json.loads(row['event']))
+            if reason:raise RuntimeError(reason)
+            if not self.store.canSpend(kind):raise RuntimeError('CAMPAIGN_SPEND_LIMIT')
+            if status=='QUEUED':
+                if self.store.acquired()+self.store.reserved()>self.store.purchaseLimit:
+                    raise RuntimeError('MAIN_PURCHASE_LIMIT')
+            elif not self.store.eligible():raise RuntimeError('MAIN_PURCHASE_LIMIT')
+            conflict=self.entryWalletConflict()
+            if conflict:raise RuntimeError(conflict)
+        tx=self.swaps.build(quote,amount,self.tx.account.address)
+        # Contract expiry only; never a deadline for the entry lifecycle.
+        if tx['to'].lower()==V3_ROUTER:
+            tx=boundEntryTransaction(tx,int(time.time())+120)
+        intent=('lamb:' if probe else 'buy:')+selectionId
+        signed=await self.tx.create(intent,selectionId,kind,tx,amount,beforeSign=beforeSign)
+        self.store.db.execute("UPDATE selections SET status=?,quoteWei=?,reason=NULL WHERE selectionId=?",
+                              ('PROBE_PENDING' if probe else 'BUY_PENDING',str(quote['output']),selectionId))
+        if not probe and getattr(self,'lamb',None) is not None:
+            self.store.db.execute("UPDATE lamb_probes SET result='PROBE_PASSED',passedAt=?,reason=NULL WHERE selectionId=?",
+                                  (time.time(),selectionId))
+        await self.tx.broadcast(signed['intentId'])
 
     async def buy(self,row,*,prepared=None):
         selectionId=row['selectionId']; token=row['token']
@@ -930,6 +1043,13 @@ class LiveExecutor:
                 (SELECT selectionId FROM transactions WHERE kind='PROBE_BUY' AND state!='EXPIRED_UNSENT')""")
         await self.tx.reconcile()
         async with (self.intakeLock if lamb is not None else nullcontext()):
+            if cleanTiming(self.store):
+                self.store.db.execute("""UPDATE selections SET status='SKIPPED',reason='RESTART_UNSENT_ENTRY'
+                    WHERE status IN ('QUEUED','BUY_PENDING') AND selectionId IN
+                    (SELECT selectionId FROM transactions WHERE kind='BUY' AND state='EXPIRED_UNSENT')""")
+                self.store.db.execute("""UPDATE selections SET status='PROBE_FAILED',reason='RESTART_UNSENT_ENTRY'
+                    WHERE status IN ('LAMB_QUEUED','PROBE_PENDING') AND selectionId IN
+                    (SELECT selectionId FROM transactions WHERE kind='PROBE_BUY' AND state='EXPIRED_UNSENT')""")
             if canonicalTiming(self.store):
                 self.store.db.execute("""UPDATE selections SET status='SKIPPED',reason='MISSED_ENTRY_DEADLINE'
                     WHERE status IN ('QUEUED','BUY_PENDING') AND selectionId IN
@@ -1233,7 +1353,10 @@ class LiveExecutor:
 
     async def run(self):
         assert int(await self.rpc.call('eth_chainId',[]),16)==4663
-        await self.fx.get()  # Cache FX before first five-second selector decision.
+        await self.fx.get()
+        if cleanTiming(self.store):
+            self.armedAt=time.time()
+            self.store.set('armedAt',self.armedAt)
         title=('BLACK SWAN CONFIGURED V3 | '+str(self.store.purchaseLimit)+' x GBP '+str(self.store.buyGbp)
                +' | '+str(self.store.configuredCampaign['exits']) if self.store.configuredCampaign else
                'BLACK SWAN 3 | FLEX '+str(self.store.purchaseLimit)+' x GBP '+str(self.store.buyGbp)+' | 80% 1.5x / 20% 3x / NO RESERVE'
@@ -1254,7 +1377,7 @@ class LiveExecutor:
             self.readSelections()
             self.readRevocations()
             self.readNewVenues()
-            if canonicalTiming(self.store):
+            if cleanTiming(self.store) or canonicalTiming(self.store):
                 self.spawn('RECEIPTS',self.reconcileReceipts())
                 if time.time()-getattr(self,'lastEntryFxWarm',0)>=30:
                     self.lastEntryFxWarm=time.time()
@@ -1309,7 +1432,7 @@ class LiveExecutor:
                         self.spawn('APPROVE:'+position['selectionId'],
                                    self.preApprove(position))
             approvalActive=any(key.startswith('APPROVE:') for key in self.active)
-            if canonicalTiming(self.store):
+            if cleanTiming(self.store) or canonicalTiming(self.store):
                 if self.store.get('intakeState','OPEN')=='OPEN':
                     for row in self.store.db.execute("SELECT * FROM selections WHERE status IN ('QUEUED','PROBE_CONFIRMED','LAMB_QUEUED') ORDER BY CASE status WHEN 'QUEUED' THEN 0 WHEN 'PROBE_CONFIRMED' THEN 1 ELSE 2 END,decisionAt").fetchall():
                         if self.lamb is not None and self.lamb.activity is not None and row['status']=='PROBE_CONFIRMED':
@@ -1336,7 +1459,7 @@ class LiveExecutor:
                 if self.lamb:self.store.set('executorHeartbeat',now)
                 if self.manual:self.store.set('manualExitHeartbeat',now)
                 print('LIVE HEALTH',json.dumps(self.store.status()),flush=True)
-            await asyncio.sleep(.10 if canonicalTiming(self.store) else .25)
+            await asyncio.sleep(.10 if cleanTiming(self.store) or canonicalTiming(self.store) else .25)
 
     async def close(self):
         if self.venueWatcher is not None:await self.venueWatcher.close()

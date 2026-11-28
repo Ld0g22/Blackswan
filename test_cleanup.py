@@ -105,6 +105,12 @@ class CleanEntryTests(unittest.IsolatedAsyncioTestCase):
         c.store.configuredCampaign=None
         await c.confirmed()
         c.store.configuredCampaign=campaign_v3.cleanCampaign(WALLET,"concentration")
+        previous=c.rpc.call
+        async def rpc(method,params):
+            if method=='eth_getBlockByNumber':
+                return {'number':hex(10),'timestamp':hex(int(time.time())-60),'hash':'0x'+'ab'*32}
+            return await previous(method,params)
+        c.rpc.call=rpc
         c.rpc.head=509
         await LiveExecutor.processEntry(c.owner,c.selection())
         self.assertEqual(c.status(),"PROBE_CONFIRMED")

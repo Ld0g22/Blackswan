@@ -36,7 +36,8 @@ class DummyRoutes:
 
 class DummyJournal:
     def __init__(self,store):self.account=SimpleNamespace(address=WALLET);self.store=store;self.signed=[]
-    async def create(self,intent,selection,kind,transaction,amount=0):
+    async def create(self,intent,selection,kind,transaction,amount=0,*,beforeSign=None):
+        if beforeSign is not None:beforeSign()
         self.signed.append((intent,selection,kind,amount))
         tx='0x'+f'{len(self.signed)+500:064x}'
         self.store.db.execute("""INSERT OR IGNORE INTO transactions
