@@ -36,10 +36,8 @@ MAX_SCAN_BLOCKS = 512
 HEAD_CACHE_SECONDS = 0.75
 MIN_SCAN_BLOCKS = 10
 DEFAULT_SCAN_BLOCKS = 10
-RANGE_FILL_SECONDS = 1.0
 ACTIVE_RETRY_SECONDS = 0.75
 TRADE_HINT_SECONDS = 10.0
-MAX_ACTIONABLE_DECISION_LAG_SECONDS = 15
 MAX_POST_PASS_AUDITS_PER_CYCLE = 12
 
 
@@ -103,7 +101,8 @@ class ConcentrationSelector(Selector):
         if type(maxScanBlocks) is not int or not MIN_SCAN_BLOCKS <= maxScanBlocks <= MAX_SCAN_BLOCKS:
             raise ValueError("INVALID_CONCENTRATION_SCAN_BLOCK_LIMIT")
         self.scanLimit=maxScanBlocks
-        self.partialRangeSince=None
+        self.liveStartAt=None
+        self.liveStartBlock=None
         self.windowSeconds = windowSeconds
         self.thresholdBps = thresholdBps
         self.firstTradeTimeoutSeconds = firstTradeTimeoutSeconds
@@ -234,7 +233,7 @@ class ConcentrationSelector(Selector):
                 if response.status!=200:
                     reason="RPC_HTTP_"+str(response.status)
                     self.rpcErrors[method+":"+reason]+=1
-                    if response.status==429 or response.status>=500:
+                    if response.status==429 or (response.status>=500 and response.headers.get('Retry-After')):
                         self.pauseRpc(response.headers.get("Retry-After"))
                     elif response.status in (401,402,403):
                         # Authentication/quota failures cannot be fixed by a
@@ -245,7 +244,6 @@ class ConcentrationSelector(Selector):
         except (aiohttp.ClientError,asyncio.TimeoutError,ValueError) as exc:
             reason="RPC_TRANSPORT_"+type(exc).__name__
             self.rpcErrors[method+":"+reason]+=1
-            self.pauseRpc()
             raise RuntimeError(reason) from None
         if not isinstance(data,dict) or "error" in data or "result" not in data:
             error=data.get("error") if isinstance(data,dict) else None
@@ -493,10 +491,9 @@ class ConcentrationSelector(Selector):
         status=result.pop("status")
         latency=self.wallTime()-cutoff
         result["decisionLagSeconds"]=round(max(0,latency),3)
-        if status=="PASS" and latency>MAX_ACTIONABLE_DECISION_LAG_SECONDS:
-            result["hypotheticalStatus"]="PASS"
-            result["reason"]="CONCENTRATION_WINDOW_TOO_OLD"
-            status="UNKNOWN"
+        result["actionable"]=(status=="PASS"
+            and (self.liveStartAt is None or first["blockTimestamp"]>=self.liveStartAt)
+            and (self.liveStartBlock is None or first["blockNumber"]>self.liveStartBlock))
         self.finish(key,status,result)
 
     async def scanGroup(self,keys,head=None):
@@ -546,7 +543,28 @@ class ConcentrationSelector(Selector):
             break
         if not isinstance(logs,list):
             raise RuntimeError("INVALID_RPC_LOGS_RESULT")
+        # Read distinct trade and preceding boundary headers in bounded
+        # concurrent waves, then retain the original final canonical fence.
+        numbers=set()
+        for raw in logs:
+            if raw.get("removed"):
+                raise RuntimeError("RPC_LOG_MARKED_REMOVED")
+            topics=raw.get("topics") or []
+            if len(topics)<2 or not isinstance(topics[1],str) or topics[1].lower() not in byPool:
+                raise RuntimeError("LOG_OUTSIDE_REQUESTED_POOLS")
+            number=int(raw["blockNumber"],16)
+            if not start<=number<=last:
+                raise RuntimeError("LOG_OUTSIDE_REQUESTED_RANGE")
+            numbers.add(number)
+        numbers.update(item["previous"]["endBlock"] for item in group if item["previous"] is not None)
         verified={last:(endHash,endTimestamp)}
+        missing=sorted(numbers-{last})
+        for index in range(0,len(missing),MAX_RPC_CONCURRENCY):
+            wave=missing[index:index+MAX_RPC_CONCURRENCY]
+            replies=await asyncio.gather(*(self._header(n) for n in wave),return_exceptions=True)
+            for number,reply in zip(wave,replies):
+                if isinstance(reply,BaseException):raise reply
+                verified[number]=reply
         newRows=defaultdict(list)
         for raw in logs:
             if raw.get("removed"):
@@ -557,7 +575,6 @@ class ConcentrationSelector(Selector):
             number=int(raw["blockNumber"],16)
             if not start<=number<=last:
                 raise RuntimeError("LOG_OUTSIDE_REQUESTED_RANGE")
-            if number not in verified:verified[number]=await self._header(number)
             blockHash,blockTimestamp=verified[number]
             for item in byPool[topics[1].lower()]:
                 if number<item["nextBlock"]:continue
@@ -572,16 +589,13 @@ class ConcentrationSelector(Selector):
         # hash changed, rewind that candidate rather than merging forks.
         # The final range-end fence follows these checks, so each new
         # verified anchor extends the already validated canonical ancestry.
-        previousHeaders={}
         valid=[]
         invalid=[]
         for item in group:
             previous=item["previous"]
             if previous is not None:
                 number=previous["endBlock"]
-                if number not in previousHeaders:
-                    previousHeaders[number]=await self._header(number)
-                if previousHeaders[number][0]!=previous["endHash"]:
+                if verified[number][0]!=previous["endHash"]:
                     invalid.append(item)
                     continue
             valid.append(item)
@@ -659,15 +673,7 @@ class ConcentrationSelector(Selector):
             start=min(row["nextBlock"] for row in ready)
         end=min(head,start+self.scanLimit-1)
         group=[row for row in ready if start<=row["nextBlock"]<=end]
-        # Fill the provider-sized range near the live head rather than
-        # sending a separate getLogs request for every single new block.
-        now=time.monotonic()
-        urgent=any(row["firstTradeAt"] is not None and
-                   self.wallTime()>=row["firstTradeAt"]+self.windowSeconds for row in group)
-        if end-start+1<self.scanLimit and not urgent:
-            if self.partialRangeSince is None:self.partialRangeSince=now
-            if now-self.partialRangeSince<RANGE_FILL_SECONDS:return []
-        self.partialRangeSince=None
+        # Process the available contiguous range now.
         return group
 
     async def coverageCycle(self):
@@ -712,7 +718,6 @@ class ConcentrationSelector(Selector):
     async def coverageLoop(self):
         """One shared canonical scanner, regardless of candidate count."""
         while not self.stopping.is_set():
-            self.expireUnstarted(time.time())
             try:
                 progressed=await self.coverageCycle()
             except (RuntimeError,ValueError,KeyError,IndexError,TypeError,
@@ -873,6 +878,8 @@ class ConcentrationSelector(Selector):
             chain=await self.rpc("eth_chainId",[],timeout=8)
             if int(chain,16)!=CHAIN_ID:
                 raise RuntimeError("WRONG_CHAIN")
+            self.liveStartAt=int(self.wallTime())
+            self.liveStartBlock=await self.head()
             self.markReady(int(chain,16))
             # Pending decisions are resumed from the saved chain block cursor,
             # never rewritten as UNKNOWN merely because the process restarted.
