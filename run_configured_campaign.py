@@ -16,7 +16,7 @@ import subprocess
 import threading
 import time
 
-from campaign_v3 import defaultCampaign, concentrationCampaign, validateCampaign, campaignDigest
+from campaign_v3 import defaultCampaign, concentrationCampaign, cleanCampaign, validateCampaign, campaignDigest
 from run_fresh_peaks import (validateWalletFile, detectorReady, startWorker, drain,
                              stopWorkers, newExperimentId, readLines)
 from campaign_config import otherLiveExecutors
@@ -73,7 +73,7 @@ def requireIdentity(directory,config):
         raise RuntimeError("EXECUTION_LEDGER_MISSING")
     with sqlite3.connect(f'file:{ledger.resolve()}?mode=ro',uri=True,timeout=3) as db:
         recorded=dict(db.execute("SELECT key,value FROM meta"))
-    if recorded.get("campaignVersion")!="3" or recorded.get("campaignIdentity")!=campaignDigest(config):
+    if recorded.get("campaignVersion")!=str(config["schemaVersion"]) or recorded.get("campaignIdentity")!=campaignDigest(config):
         raise RuntimeError("EXECUTION_LEDGER_IDENTITY_MISMATCH")
 
 
@@ -102,6 +102,8 @@ def startOrResume(args,root):
         directory=args.run_dir.expanduser().resolve()
         config=validateCampaign(json.loads((directory/"campaign.json").read_text()))
         requireIdentity(directory,config)
+    if config["schemaVersion"]!=4:
+        raise ValueError("LEGACY_CAMPAIGN_USE_PINNED_REVISION_b5e4a69")
     if not args.arm_live:
         raise ValueError("LIVE_TRADING_REQUIRES_EXPLICIT_--arm-live")
     if args.env is None:
@@ -124,7 +126,7 @@ def startOrResume(args,root):
     preflight(python,root,env,walletFile,config["sacrifice"]["enabled"])
 
     if directory is None:
-        directory=args.data_dir.expanduser().resolve()/("configured_v3_"+newExperimentId())
+        directory=args.data_dir.expanduser().resolve()/("configured_v4_"+newExperimentId())
         directory.mkdir(parents=True,exist_ok=False)
         (directory/"campaign.json").write_text(json.dumps(config,sort_keys=True,indent=2)+"\n")
 
@@ -245,8 +247,7 @@ def main():
         if args.command=="template":
             if args.config is None or args.wallet_address is None:
                 parser.error("template requires --config and --wallet-address")
-            config=(concentrationCampaign(args.wallet_address) if args.selector=="concentration"
-                    else validateCampaign(defaultCampaign(args.wallet_address)))
+            config=cleanCampaign(args.wallet_address,args.selector)
             if args.micro_test:
                 config["main"]={"stakeGbp":"0.05","maxPurchases":1}
                 config["limits"]={"maxSacrifices":1,"maxNominalSpendGbp":"0.06"}

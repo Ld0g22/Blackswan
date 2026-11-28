@@ -108,9 +108,11 @@ class CampaignFinance:
         if now<self.nextCheck:
             return
         self.nextCheck=now+5.0
-        entries=self.db.execute("""SELECT * FROM transactions
-            WHERE state IN ('CONFIRMED','REVERTED') AND receipt IS NOT NULL
-            ORDER BY createdAt""").fetchall()
+        entries=self.db.execute("""SELECT t.* FROM transactions t
+            LEFT JOIN finance_events f ON f.txHash=t.txHash
+            WHERE t.state IN ('CONFIRMED','REVERTED') AND t.receipt IS NOT NULL
+              AND (f.txHash IS NULL OR (f.state!='COMPLETE' AND f.nextRetryAt<=?))
+            ORDER BY t.createdAt""",(now,)).fetchall()
         for row in entries:
             previous=self.db.execute('SELECT state,attempts,nextRetryAt FROM finance_events WHERE txHash=?',
                                      (row['txHash'],)).fetchone()

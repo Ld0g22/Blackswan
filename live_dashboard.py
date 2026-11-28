@@ -101,7 +101,7 @@ def snapshot(directory,now=None):
                                and meta.get('exitPolicy')==FLEX_POLICY))
                 early=meta.get('campaignKind')==EARLY_KIND and meta.get('exitPolicy')==EARLY_POLICY
                 pilot=(meta.get('campaignKind')==PILOT_KIND and meta.get('exitPolicy')==PILOT_POLICY) or early
-                configured=meta.get('campaignKind')=='CONFIGURED_V3'
+                configured=meta.get('campaignKind') in ('CONFIGURED_V3','CONFIGURED_V4')
                 sacrificial=(configured and meta.get('sacrificeEnabled')=='1') or meta.get('campaignKind') in ('FIVE_LAMB','ONE_50P_LAMB','TWO_50P_LAMB','TWO_50P_2X_LAMB','ONE_20P_2X_LAMB',FLEX_KIND,PILOT_KIND,EARLY_KIND)
                 lastStage=('trigger1000,sold3,sold5,sold1000,soldQty3,soldQty5,soldQty1000'
                            if sacrificial else 'trigger10,sold3,sold5,sold10,soldQty3,soldQty5,soldQty10')
