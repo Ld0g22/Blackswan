@@ -1034,12 +1034,12 @@ class LiveExecutor:
         # A crash can occur after durable signing but before updating selection
         # status. Any signed/confirmed buy is still a real purchase candidate.
         self.store.db.execute('''UPDATE selections SET status='BUY_PENDING'
-          WHERE status IN ('QUEUED','SKIPPED') AND selectionId IN
+          WHERE status IN ('QUEUED','SKIPPED','PROBE_CONFIRMED','REVOKED') AND selectionId IN
           (SELECT selectionId FROM transactions WHERE kind='BUY' AND state!='EXPIRED_UNSENT')''')
         lamb=getattr(self,'lamb',None)
         if lamb is not None:
             self.store.db.execute("""UPDATE selections SET status='PROBE_PENDING'
-                WHERE status='LAMB_QUEUED' AND selectionId IN
+                WHERE status IN ('LAMB_QUEUED','REVOKED') AND selectionId IN
                 (SELECT selectionId FROM transactions WHERE kind='PROBE_BUY' AND state!='EXPIRED_UNSENT')""")
         await self.tx.reconcile()
         async with (self.intakeLock if lamb is not None else nullcontext()):
