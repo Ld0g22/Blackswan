@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 from broadcast_rpc import BroadcastError, sendRaw
+from entry_timing import parallelReads
 
 CHAIN_ID = 4663
 
@@ -56,6 +57,7 @@ class TransactionJournal:
         self.account, self.privateKey = account, privateKey
         self.lock = asyncio.Lock()
         self.lastCheck = 0.0
+        self.broadcasting=set()
 
     async def rpcCall(self, method, params):
         return await self.rpc.call(method, params)
@@ -88,36 +90,43 @@ class TransactionJournal:
             self.requireDeadline(deadlineAt)
             if self.unsettled():
                 raise RuntimeError('WALLET_TRANSACTION_IN_FLIGHT')
-            chainId = int(await self.rpcCall('eth_chainId', []), 16)
-            if chainId != CHAIN_ID:
-                raise RuntimeError('WRONG_CHAIN')
             tx = dict(transaction)
             tx['chainId'] = CHAIN_ID
             tx['from'] = self.account.address
             if 'to' not in tx or not tx['to']:
                 raise ValueError('No recipient contract')
-            code = await self.rpcCall('eth_getCode',[tx['to'],'latest'])
-            if not code or code == '0x':
-                raise RuntimeError('TARGET_CONTRACT_HAS_NO_CODE')
-            # Simulate exact calldata from this address; do not sign known reverts.
-            await self.rpcCall('eth_call',[{
-                'from':tx['from'],'to':tx['to'],'data':tx.get('data','0x'),
-                'value':hex(tx.get('value',0))},'latest'])
-            gasEstimate = int(await self.rpcCall('eth_estimateGas',[{
-                'from':tx['from'],'to':tx['to'],'data':tx.get('data','0x'),
-                'value':hex(tx.get('value',0))}]),16)
-            # Leave room for state changes without treating gas as a trading signal.
-            tx['gas'] = gasEstimate * 125 // 100 + 15000
-            # This chain exposes EIP-1559 baseFee + priority fees. A legacy
-            # gasPrice copied directly from eth_gasPrice can be under the next
-            # block's base fee by the time eth_sendRawTransaction is processed.
-            block=await self.rpcCall('eth_getBlockByNumber',['latest',False])
-            suggestedPriority=await self.rpcCall('eth_maxPriorityFeePerGas',[])
+            call={'from':tx['from'],'to':tx['to'],'data':tx.get('data','0x'),
+                  'value':hex(tx.get('value',0))}
+            if deadlineAt is not None:
+                chain,code,_,gas=await parallelReads(
+                    self.rpcCall('eth_chainId',[]),
+                    self.rpcCall('eth_getCode',[tx['to'],'latest']),
+                    self.rpcCall('eth_call',[call,'latest']),
+                    self.rpcCall('eth_estimateGas',[call]))
+                if int(chain,16)!=CHAIN_ID:raise RuntimeError('WRONG_CHAIN')
+                if not code or code=='0x':raise RuntimeError('TARGET_CONTRACT_HAS_NO_CODE')
+                self.requireDeadline(deadlineAt)
+                block,suggestedPriority,nonceRaw,balance=await parallelReads(
+                    self.rpcCall('eth_getBlockByNumber',['latest',False]),
+                    self.rpcCall('eth_maxPriorityFeePerGas',[]),
+                    self.rpcCall('eth_getTransactionCount',[tx['from'],'pending']),
+                    self.rpcCall('eth_getBalance',[tx['from'],'latest']))
+            else:
+                if int(await self.rpcCall('eth_chainId',[]),16)!=CHAIN_ID:
+                    raise RuntimeError('WRONG_CHAIN')
+                code=await self.rpcCall('eth_getCode',[tx['to'],'latest'])
+                if not code or code=='0x':raise RuntimeError('TARGET_CONTRACT_HAS_NO_CODE')
+                await self.rpcCall('eth_call',[call,'latest'])
+                gas=await self.rpcCall('eth_estimateGas',[call])
+                block=await self.rpcCall('eth_getBlockByNumber',['latest',False])
+                suggestedPriority=await self.rpcCall('eth_maxPriorityFeePerGas',[])
+                nonceRaw=await self.rpcCall('eth_getTransactionCount',[tx['from'],'pending'])
+                balance=await self.rpcCall('eth_getBalance',[tx['from'],'latest'])
+            tx['gas']=int(gas,16)*125//100+15000
             tx.update(eip1559FeeFields(block,suggestedPriority))
-            nonce = int(await self.rpcCall('eth_getTransactionCount',[tx['from'],'pending']),16)
-            # One local pending transaction at a time, and no duplicate nonce reuse.
-            tx['nonce'] = nonce
-            if int(await self.rpcCall('eth_getBalance',[tx['from'],'latest']),16) < tx['value']+tx['gas']*tx['maxFeePerGas']:
+            nonce=int(nonceRaw,16)
+            tx['nonce']=nonce
+            if int(balance,16)<tx['value']+tx['gas']*tx['maxFeePerGas']:
                 raise RuntimeError('INSUFFICIENT_ETH_FOR_SWAP_AND_GAS')
             tx.pop('from')
             # eth-account 0.13.7 rejects a lowercase hexadecimal recipient.
@@ -148,7 +157,15 @@ class TransactionJournal:
                 raise
             return dict(self.store.db.execute('SELECT * FROM transactions WHERE intentId=?',(intentId,)).fetchone())
 
-    async def broadcast(self, intentId):
+    async def broadcast(self,intentId):
+        if intentId in self.broadcasting:
+            row=self.store.db.execute('SELECT state FROM transactions WHERE intentId=?',(intentId,)).fetchone()
+            return row[0] if row else None
+        self.broadcasting.add(intentId)
+        try:return await self._broadcast(intentId)
+        finally:self.broadcasting.discard(intentId)
+
+    async def _broadcast(self, intentId):
         """Submit a signed transaction and record the ACTUAL response.
 
         Rejected: known pre-admission RPC error (do not retry or reuse nonce).
@@ -183,6 +200,8 @@ class TransactionJournal:
             if returned.lower()!=row['txHash'].lower():
                 raise BroadcastError('HASH_MISMATCH','Node returned a different transaction hash',False)
         except BroadcastError as exc:
+            terminal=self.confirmed(intentId)
+            if terminal:return terminal['state']
             state='REJECTED' if exc.definite else 'UNCERTAIN'
             self.store.db.execute(
                 'UPDATE transactions SET state=?,lastBroadcast=?,reason=? WHERE intentId=?',
@@ -191,12 +210,16 @@ class TransactionJournal:
             return state
         except Exception as exc:
             # An arbitrary failure does not prove whether the node accepted it.
+            terminal=self.confirmed(intentId)
+            if terminal:return terminal['state']
             reason='UNCERTAIN_EXCEPTION:'+type(exc).__name__+':'+str(exc)[:160]
             self.store.db.execute(
                 "UPDATE transactions SET state='UNCERTAIN',lastBroadcast=?,reason=? WHERE intentId=?",
                 (now,reason,intentId))
             print('TX UNCERTAIN',row['kind'],row['txHash'],reason,flush=True)
             return 'UNCERTAIN'
+        terminal=self.confirmed(intentId)
+        if terminal:return terminal['state']
         self.store.db.execute(
             "UPDATE transactions SET state='SENT',lastBroadcast=?,reason=NULL WHERE intentId=?",
             (now,intentId))
@@ -223,6 +246,8 @@ class TransactionJournal:
                   and not row['lastBroadcast'] and self.entryDeadline(row['intentId']) is not None
                   and time.time()>self.entryDeadline(row['intentId'])):
                 await self.broadcast(row['intentId'])
+            elif row['intentId'] in self.broadcasting:
+                continue
             elif now-row['createdAt']>120:
                 # An old swap cannot safely be resurrected indefinitely: leave
                 # its nonce unresolved until a human checks chain/mempool state.

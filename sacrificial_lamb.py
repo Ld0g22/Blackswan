@@ -9,7 +9,8 @@ import json
 import time
 
 from probe_buying_blocks import ProbeBuyingBlocks, MAX_BUYING_BLOCKS
-from entry_timing import canonicalTiming, windowEnd, targetKey, entryKwargs
+from entry_timing import (canonicalTiming, windowEnd, targetKey, entryKwargs,
+                          PreparedEntry, retryTime, recordFailure, parallelReads)
 from swap_adapters import boundEntryTransaction
 
 PROBE_GBP=Decimal('0.01')
@@ -51,16 +52,20 @@ class LambGate:
             return value
         raise ValueError('INVALID_CHAIN_BLOCK_NUMBER')
 
-    async def chainHead(self):
+    async def chainHead(self,target=None):
         # One shared block-height poll across all pending 1p positions.
         # No local estimates of block speed and no wall-clock substitution.
         async with self.headLock:
+            near=(canonicalTiming(self.store) and target is not None and
+                  self.headCached is not None and target-self.headCached<=30)
             if (self.headCached is not None
-                    and time.monotonic()-self.headCheckedAt<1.0):
+                    and time.monotonic()-self.headCheckedAt<(.20 if near else 1.0)):
                 return self.headCached
             current=self.blockNumber(await self.owner.rpc.call('eth_blockNumber',[]))
             self.headCached=current
             self.headCheckedAt=time.monotonic()
+            if canonicalTiming(self.store):
+                self.store.set('executionHead',json.dumps({'number':current,'at':time.time()}))
             return current
 
     def probeReceipt(self,selectionId,probe):
@@ -98,15 +103,32 @@ class LambGate:
             return None
         target=receiptBlock+(self.waitBlocks or 0)
         try:
-            head=await self.chainHead()
-        except (RuntimeError,ValueError,TypeError,KeyError):
-            # Retry on a later executor tick; unavailable RPC is never PASS.
+            head=await self.chainHead(target)
+        except (RuntimeError,ValueError,TypeError,KeyError) as exc:
+            if canonicalTiming(self.store):recordFailure(self.store,selectionId,'head',exc)
+            # Unavailable RPC is never PASS.
             return None
         if head<target:
             return None
+        async def header(number):
+            h=await self.owner.rpc.call('eth_getBlockByNumber',[hex(number),False])
+            if (not isinstance(h,dict) or self.blockNumber(h.get('number'))!=number
+                    or not isinstance(h.get('hash'),str) or len(h['hash'])!=66):
+                raise ValueError('INVALID_SURVIVAL_HEADER')
+            stamp=self.blockNumber(h.get('timestamp'))
+            if stamp<=0 or stamp>time.time():raise ValueError('INVALID_SURVIVAL_TIMESTAMP')
+            return h,stamp
         try:
-            canonical=await self.owner.rpc.call('eth_getTransactionReceipt',[row['txHash']])
-        except (RuntimeError,ValueError,TypeError,KeyError):
+            if canonicalTiming(self.store):
+                reads=[self.owner.rpc.call('eth_getTransactionReceipt',[row['txHash']]),
+                       header(receiptBlock)]
+                if target!=receiptBlock:reads.append(header(target))
+                evidence=await parallelReads(*reads)
+                canonical=evidence[0]
+            else:
+                canonical=await self.owner.rpc.call('eth_getTransactionReceipt',[row['txHash']])
+        except (RuntimeError,ValueError,TypeError,KeyError) as exc:
+            if canonicalTiming(self.store):recordFailure(self.store,selectionId,'survival',exc)
             return None
         if canonical is None:
             self.state(selectionId,'PROBE_UNVERIFIED','PROBE_RECEIPT_NOT_CANONICAL')
@@ -123,21 +145,12 @@ class LambGate:
             return None
         if canonicalTiming(self.store):
             # Timestamp of the exact receipt/target blocks, never time of processing.
-            async def header(number):
-                h=await self.owner.rpc.call('eth_getBlockByNumber',[hex(number),False])
-                if (not isinstance(h,dict) or self.blockNumber(h.get('number'))!=number
-                        or not isinstance(h.get('hash'),str) or len(h['hash'])!=66):
-                    raise ValueError('INVALID_SURVIVAL_HEADER')
-                stamp=self.blockNumber(h.get('timestamp'))
-                if stamp<=0 or stamp>time.time():raise ValueError('INVALID_SURVIVAL_TIMESTAMP')
-                return h,stamp
             try:
+                receiptHeader,receiptAt=evidence[1]
                 if target==receiptBlock:
-                    receiptHeader,receiptAt=await header(receiptBlock)
                     targetAt=receiptAt+getattr(self.store,'probeWaitSeconds',WAIT_SECONDS)
                 else:
-                    ((receiptHeader,receiptAt),(_,targetAt))=await asyncio.gather(
-                        header(receiptBlock),header(target))
+                    _,targetAt=evidence[2]
                     if targetAt<receiptAt:raise ValueError('INVALID_SURVIVAL_TIMESTAMP_ORDER')
                 if receiptHeader['hash'].lower()!=original['blockHash'].lower():
                     self.state(selectionId,'PROBE_UNVERIFIED','PROBE_RECEIPT_REORG_OR_MISMATCH')
@@ -145,7 +158,8 @@ class LambGate:
                 selection=self.store.db.execute('SELECT * FROM selections WHERE selectionId=?',
                                                 (selectionId,)).fetchone()
                 anchor=windowEnd(self.store,selection)
-            except (RuntimeError,ValueError,TypeError,KeyError,AttributeError):
+            except (RuntimeError,ValueError,TypeError,KeyError,AttributeError) as exc:
+                recordFailure(self.store,selectionId,'survival',exc)
                 # Provider failure cannot create a fresh deadline.
                 return None
             if not anchor<=receiptAt<=anchor+self.store.sacrificeDeadlineSeconds:
@@ -244,10 +258,15 @@ class LambGate:
             rate=await self.owner.fx.get()
             amountWei=int((getattr(self.store,'probeGbp',PROBE_GBP)/rate*10**18).to_integral_value(rounding=ROUND_DOWN))
             if amountWei<=0:raise RuntimeError('ZERO_PROBE_VALUE')
-            quote=(await self.owner.swaps.verifiedBuyCandidates(token,amountWei))[0]
-            if time.time()-anchor>budget:
-                raise RuntimeError('MISSED_1P_DEADLINE')
-            origin=await self.owner.ponsOnChain(token)
+            if canonicalTiming(self.store):
+                candidates,origin=await parallelReads(
+                    self.owner.swaps.verifiedBuyCandidates(token,amountWei),
+                    self.owner.ponsOnChain(token))
+                quote=candidates[0]
+            else:
+                quote=(await self.owner.swaps.verifiedBuyCandidates(token,amountWei))[0]
+                if time.time()-anchor>budget:raise RuntimeError('MISSED_1P_DEADLINE')
+                origin=await self.owner.ponsOnChain(token)
             if origin:raise RuntimeError(origin)
             if time.time()-anchor>budget:
                 raise RuntimeError('MISSED_1P_DEADLINE')
@@ -263,6 +282,9 @@ class LambGate:
                 if time.time()-anchor>budget:
                     self.state(selectionId,'PROBE_FAILED','MISSED_1P_DEADLINE')
                     return
+                if canonicalTiming(self.store):
+                    conflict=getattr(self.owner,'entryWalletConflict',lambda:None)()
+                    if conflict:raise RuntimeError(conflict)
                 # A durable selection-derived intent is idempotent after restart.
                 transaction=self.owner.swaps.build(quote,amountWei,self.owner.tx.account.address)
                 kwargs=entryKwargs(self.store,anchor,budget)
@@ -280,6 +302,7 @@ class LambGate:
                 print('LAMB 1P SENT',token,signed['txHash'],flush=True)
         except (RuntimeError,ValueError,KeyError,IndexError) as exc:
             reason=str(exc)
+            if canonicalTiming(self.store):recordFailure(self.store,selectionId,'sacrifice',reason)
             signed=self.store.transactions(selectionId,'PROBE_BUY')
             if signed:
                 # Signing can have succeeded even if the broadcast failed.
@@ -292,7 +315,12 @@ class LambGate:
                 self.store.db.execute(
                     "UPDATE selections SET reason=? WHERE selectionId=? AND status='LAMB_QUEUED'",
                     (reason[:160],selectionId))
-                self.store.set("probeRetryAfter:"+selectionId,time.time()+0.5)
+                retry=(retryTime(time.time(),anchor+budget,reason) if canonicalTiming(self.store)
+                       else time.time()+0.5)
+                if retry is None:
+                    self.state(selectionId,'PROBE_FAILED','MISSED_1P_DEADLINE')
+                    return
+                self.store.set("probeRetryAfter:"+selectionId,retry)
                 print('LAMB RETRYABLE',token,reason[:140],flush=True)
                 return
             elif not signed:
@@ -355,15 +383,19 @@ class LambGate:
     async def check(self,selection):
         """After configured survival gate: fresh 1p sell and 10p two-way quote."""
         selectionId=selection['selectionId']
-        if selection['status']!='PROBE_CONFIRMED':
+        canonical=canonicalTiming(self.store)
+        oldStatus=selection['status']
+        if oldStatus!='PROBE_CONFIRMED' and not (canonical and oldStatus=='QUEUED'):
             return
         probe=self.row(selectionId)
         if not probe or probe['confirmedAt'] is None:return
         now=time.time()
         # Fail-closed, but retry temporary provider/quote outages. A previous
         # PROBE_UNKNOWN terminal state silently discarded valid survivors.
-        if (probe['result']=='PROBE_CONFIRMED' and probe['lastCheck'] is not None
+        if (not canonical and probe['result']=='PROBE_CONFIRMED' and probe['lastCheck'] is not None
                 and now-float(probe['lastCheck'])<3.0):
+            return
+        if canonical and now<float(self.store.get('buyRetryAfter:'+selectionId,'0')):
             return
         targetBlock=None
         if self.waitBlocks is None and not canonicalTiming(self.store):
@@ -387,7 +419,7 @@ class LambGate:
         if self.revoked(selectionId):
             self.state(selectionId,'PROBE_FAILED','SELECTOR_REVOKED')
             return
-        if not self.store.eligible():
+        if oldStatus=='PROBE_CONFIRMED' and not self.store.eligible():
             # Reservations for pending normal 10p orders are full. Recheck
             # sellability freshly if a slot becomes available later.
             return
@@ -409,7 +441,14 @@ class LambGate:
             rate=await self.owner.fx.get()
             amountWei=int((self.store.buyGbp/rate*10**18).to_integral_value(rounding=ROUND_DOWN))
             if amountWei<=0:raise RuntimeError('ZERO_10P_VALUE')
-            quote=(await self.owner.swaps.verifiedBuyCandidates(selection['token'],amountWei))[0]
+            if canonical:
+                candidates,origin=await parallelReads(
+                    self.owner.swaps.verifiedBuyCandidates(selection['token'],amountWei),
+                    self.owner.ponsOnChain(selection['token']))
+                quote=candidates[0]
+                if origin:raise RuntimeError(origin)
+            else:
+                quote=(await self.owner.swaps.verifiedBuyCandidates(selection['token'],amountWei))[0]
             if targetBlock is not None:
                 # Full 10p buy and reverse quote are pinned to the same block;
                 # prohibit stale quotes predating the 500-block survival gate.
@@ -422,17 +461,19 @@ class LambGate:
                 raise RuntimeError('STALE_500_BLOCK_PROBE_SELL_QUOTE')
             if int(sell['output'])<=0 or int(quote['preBuySellOutput'])<=0:
                 raise RuntimeError('NOT_SELLABLE_AT_SURVIVAL_GATE')
-            origin=await self.owner.ponsOnChain(selection['token'])
-            if origin:raise RuntimeError(origin)
+            if not canonical:
+                origin=await self.owner.ponsOnChain(selection['token'])
+                if origin:raise RuntimeError(origin)
             if time.time()-started>5:
                 raise RuntimeError('STALE_SURVIVAL_GATE_QUOTES')
             async with self.owner.intakeLock:
                 current=self.store.db.execute('SELECT status FROM selections WHERE selectionId=?',
                     (selectionId,)).fetchone()
-                if (not current or current['status']!='PROBE_CONFIRMED' or
+                if (not current or current['status']!=oldStatus or
                         self.store.get('intakeState','OPEN')!='OPEN' or self.revoked(selectionId)):
                     return
-                if not self.store.eligible():return
+                if oldStatus=='PROBE_CONFIRMED' and not self.store.eligible():return
+                if oldStatus=='QUEUED' and self.store.acquired()+self.store.reserved()>self.store.purchaseLimit:return
                 now=time.time()
                 if canonicalTiming(self.store) and now>anchor+self.store.entryDeadlineSeconds:
                     self.state(selectionId,'PROBE_FAILED','MISSED_SURVIVAL_DEADLINE')
@@ -440,8 +481,8 @@ class LambGate:
                 self.store.db.execute('BEGIN IMMEDIATE')
                 try:
                     changed=self.store.db.execute(
-                        "UPDATE selections SET status='QUEUED',reason=NULL WHERE selectionId=? AND status='PROBE_CONFIRMED'",
-                        (selectionId,)).rowcount
+                        "UPDATE selections SET status='QUEUED',reason=NULL WHERE selectionId=? AND status=?",
+                        (selectionId,oldStatus)).rowcount
                     if changed:
                         self.store.db.execute(
                             "UPDATE lamb_probes SET result='PROBE_PASSED',passedAt=?,lastCheck=?,reason=NULL WHERE selectionId=?",
@@ -450,19 +491,26 @@ class LambGate:
                 except BaseException:
                     if self.store.db.in_transaction:self.store.db.execute('ROLLBACK')
                     raise
-                if changed:print('LAMB PASSED -> ORIGINAL 10P BUY',selection['token'],flush=True)
+                if changed:
+                    print('LAMB PASSED -> IMMEDIATE MAIN BUY',selection['token'],flush=True)
+                    if canonical:
+                        return PreparedEntry(selectionId,selection['token'],amountWei,quote,targetBlock,anchor,now)
         except (RuntimeError,ValueError,TypeError,KeyError,IndexError) as exc:
             # An unavailable RPC quote is UNKNOWN, never a grant of permission.
             reason=str(exc)[:160]
+            if canonical:recordFailure(self.store,selectionId,'survival',reason)
             fatal=(any(x in reason.upper() for x in
                        ('PONS_V2','WRONG_CHAIN','INVALID_SELECTION','BANNED'))
                    if getattr(self.store,'configuredCampaign',None) is not None
                    else any(x in reason.upper() for x in
                        ('NOT_SELLABLE','NO_TWO_WAY','ZERO_PROJECTED','PONS_V2','NO_SELL_ROUTE')))
-            if canonicalTiming(self.store) and time.time()>anchor+self.store.entryDeadlineSeconds:
-                fatal=True
-                reason='MISSED_SURVIVAL_DEADLINE'
-            verdict='PROBE_FAILED' if fatal else 'PROBE_CONFIRMED'
+            if canonical and not fatal:
+                retry=retryTime(time.time(),anchor+self.store.entryDeadlineSeconds,reason)
+                if retry is None:
+                    fatal=True
+                    reason='MISSED_SURVIVAL_DEADLINE'
+                else:self.store.set('buyRetryAfter:'+selectionId,retry)
+            verdict='PROBE_FAILED' if fatal else oldStatus
             if fatal:
                 self.state(selectionId,verdict,reason)
             else:
