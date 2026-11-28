@@ -124,7 +124,8 @@ class TransactionJournal:
                 balance=await self.rpcCall('eth_getBalance',[tx['from'],'latest'])
             tx['gas']=int(gas,16)*125//100+15000
             tx.update(eip1559FeeFields(block,suggestedPriority))
-            tx['nonce']=int(nonceRaw,16)
+            nonce=int(nonceRaw,16)
+            tx['nonce']=nonce
             if int(balance,16)<tx['value']+tx['gas']*tx['maxFeePerGas']:
                 raise RuntimeError('INSUFFICIENT_ETH_FOR_SWAP_AND_GAS')
             tx.pop('from')
