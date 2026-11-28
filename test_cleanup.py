@@ -147,3 +147,41 @@ class CleanJournalTests(unittest.IsolatedAsyncioTestCase):
         self.journal.rpc.call=delayed
         await self.journal.create("i","s","BUY",self.tx,1)
         self.assertGreaterEqual(peak,3)
+
+class CleanOperationsTests(unittest.TestCase):
+    def test_new_startup_has_no_fixed_value_route_test(self):
+        from run_configured_campaign import preflight
+        with patch("run_configured_campaign.subprocess.run",return_value=SimpleNamespace(returncode=0)) as run:
+            preflight(Path("/python"),Path("/repo"),Path("/env"),Path("/wallet"),True)
+        calls=[x.args[0] for x in run.call_args_list]
+        self.assertIn("--deployment-only",calls[0])
+
+    def test_exits_only_startup_does_not_require_intake(self):
+        from run_configured_campaign import preflight
+        with patch("run_configured_campaign.subprocess.run",return_value=SimpleNamespace(returncode=0)) as run:
+            preflight(Path("/python"),Path("/repo"),Path("/env"),Path("/wallet"),True,exitsOnly=True)
+        calls=[x.args[0] for x in run.call_args_list]
+        self.assertEqual(len(calls),1)
+        self.assertIn("--exits-only",calls[0])
+
+class CleanRouteTests(unittest.IsolatedAsyncioTestCase):
+    async def test_mixed_protocol_quote_never_masks_valid_atomic_route(self):
+        import peak_tracker as peak
+        from execution_peak_routes import PeakExecutionRoutes
+        token="0x"+"a"*40
+        venue=dict(id="token-usdg-v4",source="uniswapV4",token0=min(token,peak.USDG),
+                   token1=max(token,peak.USDG),fee=500,spacing=10,hooks=peak.NATIVE)
+        class Store:
+            configuredCampaign=campaign_v3.cleanCampaign(WALLET,"concentration")
+            def venues(self,t):return [venue]
+        async def block():return "0x10"
+        routes=PeakExecutionRoutes(SimpleNamespace(block=block,wallet=WALLET),None,Store())
+        async def quote(pool,tokenIn,amount,at):
+            if pool["id"]==peak.USDG_BRIDGES[0]["id"]:out=200
+            elif pool["id"]==peak.USDG_BRIDGES[1]["id"]:out=100
+            else:out=amount*2
+            return dict(out=out,spent=amount,basis="FAKE")
+        routes.originalQuoter.quote=quote
+        result=(await routes.directQuotes(token,10,True))[0]
+        self.assertEqual(result["output"],200)
+        self.assertEqual(result["peakRoute"],peak.USDG_BRIDGES[1]["id"]+">"+venue["id"])
