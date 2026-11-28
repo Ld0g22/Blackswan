@@ -513,6 +513,7 @@ class LiveExecutor:
         self.detector.row_factory=sqlite3.Row
         self.jobs=set()
         self.active=set()
+        self.exitReady=set()
         self.lastStatus=0.0
         self.intakeLock=asyncio.Lock()
         self.exitThresholds=(EARLY_TRIGGER_MULTIPLES.copy() if store.flexEarly else {})
@@ -728,8 +729,12 @@ class LiveExecutor:
     def entryWalletConflict(self):
         # Read-only quote/approval work does not block preparation. An actual
         # urgent exit or unresolved wallet intent does retain priority.
-        if any(key.startswith('EXIT:') for key in getattr(self,'active',())):
-            return 'URGENT_EXIT_WALLET_PRIORITY'
+        active=getattr(self,'active',())
+        if cleanTiming(self.store):
+            urgent=bool(getattr(self,'exitReady',())) or any(key.startswith('MANUAL_EXIT:') for key in active)
+        else:
+            urgent=any(key.startswith('EXIT:') for key in active)
+        if urgent:return 'URGENT_EXIT_WALLET_PRIORITY'
         if hasattr(self.tx,'unsettled') and self.tx.unsettled():
             return 'WALLET_TRANSACTION_IN_FLIGHT'
         return None
@@ -800,8 +805,8 @@ class LiveExecutor:
             if not self.store.canSpend(kind):raise RuntimeError('CAMPAIGN_SPEND_LIMIT')
             if status!='QUEUED' and not self.store.eligible():
                 raise RuntimeError('MAIN_PURCHASE_LIMIT')
-            conflict=self.entryWalletConflict()
-            if conflict:raise RuntimeError(conflict)
+            # Independent quote preparation does not need the wallet nonce.
+            # Check real conflicts at journal admission/signing.
             rate=await self.fx.get()
             stake=self.store.probeGbp if probe else self.store.buyGbp
             amount=int((stake/rate*10**18).to_integral_value(rounding=ROUND_DOWN))
@@ -1140,7 +1145,8 @@ class LiveExecutor:
                     print('SELL CONFIRMED',str(stage)+'x',position['token'],'qty',debited,row['txHash'],flush=True)
 
     def pendingFor(self,selectionId,kind):
-        return self.store.db.execute("SELECT 1 FROM transactions WHERE selectionId=? AND kind=? AND state IN ('SIGNED','SENT')",
+        states="('SIGNED','SENT','UNCERTAIN','REJECTED','STUCK')" if cleanTiming(self.store) else "('SIGNED','SENT')"
+        return self.store.db.execute("SELECT 1 FROM transactions WHERE selectionId=? AND kind=? AND state IN "+states,
                   (selectionId,kind)).fetchone() is not None
 
     async def preApprove(self,position):
@@ -1208,8 +1214,17 @@ class LiveExecutor:
             return
         # Persist retries across restarts. An illiquid/reverting market must not
         # cause four quote attempts per second forever.
+        clean=cleanTiming(self.store)
         retryKey='sellRetryAfter:'+selectionId
-        if time.time()<float(self.store.get(retryKey,'0')):
+        if clean:
+            # An actual new successful observation, not an arbitrary cooldown,
+            # is the evidence needed to retry an unavailable/reverting quote.
+            marker=self.store.get('sellFailedObservation:'+selectionId,'')
+            if marker:
+                last=self.store.db.execute("SELECT MAX(id) FROM observations WHERE token=? AND phase='SELL' AND status='ONCHAIN_QUOTE_ONLY'",(token,)).fetchone()[0]
+                if int(last or 0)<=int(marker):return
+            if hasattr(self.tx,'unsettled') and self.tx.unsettled():return
+        elif time.time()<float(self.store.get(retryKey,'0')):
             return
         if self.store.configuredCampaign is not None:
             stage=next((x for x,_ in self.stages
@@ -1246,6 +1261,7 @@ class LiveExecutor:
                 approvalTx=self.swaps.buildApproval(approval)
                 intent='approve:'+selectionId+':'+action+':'+str(len(history)+1)
                 if manual and manual.active(selectionId):return
+                if clean:self.exitReady.add(selectionId)
                 tx=await self.tx.create(intent,selectionId,action,approvalTx)
                 state=await self.tx.broadcast(tx['intentId'])
                 print('APPROVAL',token,approval[0],approval[2],'state='+str(state),flush=True)
@@ -1255,6 +1271,7 @@ class LiveExecutor:
             swapTx=self.swaps.build(quote,amount,self.tx.account.address)
             intent='sell:'+selectionId+':'+str(stage)+':'+str(len(attempts)+1)
             if manual and manual.active(selectionId):return
+            if clean:self.exitReady.add(selectionId)
             tx=await self.tx.create(intent,selectionId,kind,swapTx,amount)
             state=await self.tx.broadcast(tx['intentId'])
             print('SELL SUBMISSION',str(stage)+'x',token,tx['txHash'],
@@ -1264,8 +1281,16 @@ class LiveExecutor:
             reason=str(exc)
             if reason=='WALLET_TRANSACTION_IN_FLIGHT':
                 return
-            self.store.set(retryKey,time.time()+10.0)
-            print('SELL RETRY IN 10s',str(stage)+'x',token,reason[:200],flush=True)
+            if clean:
+                last=self.store.db.execute("SELECT MAX(id) FROM observations WHERE token=? AND phase='SELL' AND status='ONCHAIN_QUOTE_ONLY'",(token,)).fetchone()[0]
+                self.store.set('sellFailedObservation:'+selectionId,int(last or 0))
+                self.store.set('sellLastError:'+selectionId,reason[:200])
+                print('SELL WAIT FOR NEW QUOTE',str(stage)+'x',token,reason[:200],flush=True)
+            else:
+                self.store.set(retryKey,time.time()+10.0)
+                print('SELL RETRY IN 10s',str(stage)+'x',token,reason[:200],flush=True)
+        finally:
+            if clean:getattr(self,'exitReady',set()).discard(selectionId)
 
     async def checkPosition(self,position):
         token=position['token'];now=time.time()
@@ -1357,7 +1382,7 @@ class LiveExecutor:
         if cleanTiming(self.store):
             self.armedAt=time.time()
             self.store.set('armedAt',self.armedAt)
-        title=('BLACK SWAN CONFIGURED V3 | '+str(self.store.purchaseLimit)+' x GBP '+str(self.store.buyGbp)
+        title=('BLACK SWAN CONFIGURED V'+str(self.store.configuredCampaign['schemaVersion'])+' | '+str(self.store.purchaseLimit)+' x GBP '+str(self.store.buyGbp)
                +' | '+str(self.store.configuredCampaign['exits']) if self.store.configuredCampaign else
                'BLACK SWAN 3 | FLEX '+str(self.store.purchaseLimit)+' x GBP '+str(self.store.buyGbp)+' | 80% 1.5x / 20% 3x / NO RESERVE'
                if self.store.flexEarly else

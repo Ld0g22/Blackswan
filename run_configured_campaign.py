@@ -105,6 +105,10 @@ def startOrResume(args,root):
         requireIdentity(directory,config)
     if config["schemaVersion"]!=4:
         raise ValueError("LEGACY_CAMPAIGN_USE_PINNED_REVISION_b5e4a69")
+    # This branch is based on concentration. Do not silently substitute its
+    # historical buying-block defaults for the independent 3–10 block build.
+    if config["selector"]["name"]!="concentration":
+        raise ValueError("BUYING_BLOCK_CLEAN_PORT_NOT_VERIFIED_USE_INDEPENDENT_BUILD")
     if not args.arm_live:
         raise ValueError("LIVE_TRADING_REQUIRES_EXPLICIT_--arm-live")
     if args.env is None:
@@ -231,7 +235,7 @@ def main():
     parser.add_argument("--config",type=Path)
     parser.add_argument("--wallet-address")
     parser.add_argument("--micro-test",action="store_true",help="Template only: 1 x £0.05 main, 1 x £0.01 sacrifice, nominal £0.06 cap; excludes gas")
-    parser.add_argument("--selector",choices=("buyingBlocks","concentration"),default="buyingBlocks",help="New campaign template selector only")
+    parser.add_argument("--selector",choices=("buyingBlocks","concentration"),default="concentration",help="New campaign template selector only")
     parser.add_argument("--arm-live",action="store_true")
     parser.add_argument("--run-dir",type=Path)
     parser.add_argument("--env",type=Path,help="Explicit verified NEW Alchemy environment")
@@ -295,7 +299,7 @@ def main():
                                   "workerState":meta.get("workerState"),
                                   "version":meta.get("campaignVersion")},indent=2))
             return
-        if args.selector!="buyingBlocks":
+        if args.selector!="concentration":
             parser.error("--selector is for template generation; campaign start/resume reads the frozen config")
         startOrResume(args,Path(__file__).resolve().parent)
     except (ValueError,RuntimeError,OSError,KeyError,json.JSONDecodeError,sqlite3.Error) as exc:

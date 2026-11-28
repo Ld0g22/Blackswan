@@ -243,7 +243,11 @@ class TransactionJournal:
             elif cleanTiming(self.store) and row['kind'] in ('BUY','PROBE_BUY'):
                 if row['state']=='SIGNED' and not row['lastBroadcast']:
                     self.store.db.execute("UPDATE transactions SET state='EXPIRED_UNSENT',reason='RESTART_UNSIGNED_INTENT' WHERE intentId=?",(row['intentId'],))
-                # Possible sends stay reconcilable and are not retransmitted.
+                # Report an unresolved submission without resending, freeing its
+                # nonce, or declaring failure. Receipts remain authoritative.
+                elif now-row['createdAt']>120 and row['state']!='STUCK':
+                    self.store.db.execute("UPDATE transactions SET state='STUCK',reason='UNCONFIRMED_MANUAL_RECONCILIATION_REQUIRED' WHERE intentId=?",(row['intentId'],))
+                    print('CRITICAL STUCK TRANSACTION',row['intentId'],row['txHash'],flush=True)
             elif now-row['createdAt']>120:
                 # An old swap cannot safely be resurrected indefinitely: leave
                 # its nonce unresolved until a human checks chain/mempool state.

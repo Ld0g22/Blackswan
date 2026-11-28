@@ -185,3 +185,14 @@ class CleanRouteTests(unittest.IsolatedAsyncioTestCase):
         result=(await routes.directQuotes(token,10,True))[0]
         self.assertEqual(result["output"],200)
         self.assertEqual(result["peakRoute"],peak.USDG_BRIDGES[1]["id"]+">"+venue["id"])
+
+class CleanExitTests(unittest.TestCase):
+    def test_read_only_exit_job_does_not_own_wallet(self):
+        store=SimpleNamespace(configuredCampaign=campaign_v3.cleanCampaign(WALLET,"concentration"))
+        owner=SimpleNamespace(store=store,active={"EXIT:s"},exitReady=set(),tx=SimpleNamespace(unsettled=lambda:[]))
+        self.assertIsNone(LiveExecutor.entryWalletConflict(owner))
+        owner.exitReady.add("s")
+        self.assertEqual(LiveExecutor.entryWalletConflict(owner),"URGENT_EXIT_WALLET_PRIORITY")
+        owner.exitReady.clear()
+        owner.active.add("MANUAL_EXIT:r")
+        self.assertEqual(LiveExecutor.entryWalletConflict(owner),"URGENT_EXIT_WALLET_PRIORITY")
