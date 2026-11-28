@@ -732,6 +732,8 @@ class LiveExecutor:
         return None
 
     async def processEntry(self,row):
+        if row['status']!='LAMB_QUEUED' and time.time()<float(self.store.get('buyRetryAfter:'+row['selectionId'],'0')):
+            return
         if self.lamb is not None:
             if row['status']=='LAMB_QUEUED':
                 await self.lamb.start(row)
@@ -1309,7 +1311,7 @@ class LiveExecutor:
             approvalActive=any(key.startswith('APPROVE:') for key in self.active)
             if canonicalTiming(self.store):
                 if self.store.get('intakeState','OPEN')=='OPEN':
-                    for row in self.store.db.execute("SELECT * FROM selections WHERE status IN ('QUEUED','PROBE_CONFIRMED','LAMB_QUEUED') ORDER BY CASE status WHEN 'QUEUED' THEN 0 WHEN 'PROBE_CONFIRMED' THEN 1 ELSE 2 END,decisionAt LIMIT 20").fetchall():
+                    for row in self.store.db.execute("SELECT * FROM selections WHERE status IN ('QUEUED','PROBE_CONFIRMED','LAMB_QUEUED') ORDER BY CASE status WHEN 'QUEUED' THEN 0 WHEN 'PROBE_CONFIRMED' THEN 1 ELSE 2 END,decisionAt").fetchall():
                         if self.lamb is not None and self.lamb.activity is not None and row['status']=='PROBE_CONFIRMED':
                             self.spawn('ACTIVITY:'+row['selectionId'],self.lamb.collectActivity(row))
                         self.spawn('ENTRY:'+row['selectionId'],self.processEntry(row))

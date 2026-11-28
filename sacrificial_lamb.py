@@ -395,7 +395,7 @@ class LambGate:
         if (not canonical and probe['result']=='PROBE_CONFIRMED' and probe['lastCheck'] is not None
                 and now-float(probe['lastCheck'])<3.0):
             return
-        if canonical and now<float(self.store.get('survivalRetryAfter:'+selectionId,'0')):
+        if canonical and now<float(self.store.get('buyRetryAfter:'+selectionId,'0')):
             return
         targetBlock=None
         if self.waitBlocks is None and not canonicalTiming(self.store):
@@ -509,7 +509,7 @@ class LambGate:
                 if retry is None:
                     fatal=True
                     reason='MISSED_SURVIVAL_DEADLINE'
-                else:self.store.set('survivalRetryAfter:'+selectionId,retry)
+                else:self.store.set('buyRetryAfter:'+selectionId,retry)
             verdict='PROBE_FAILED' if fatal else oldStatus
             if fatal:
                 self.state(selectionId,verdict,reason)
