@@ -29,7 +29,8 @@ from campaign_config import (FLEX_KIND, FLEX_POLICY, PILOT_KIND, PILOT_POLICY,
     globalWalletLock, otherLiveExecutors)
 from campaign_finance import CampaignFinance
 from campaign_v3 import validateCampaign, campaignDigest
-from entry_timing import canonicalTiming, windowEnd, entryKwargs
+from entry_timing import (canonicalTiming, windowEnd, entryKwargs, PreparedEntry,
+                          retryTime, recordFailure, parallelReads)
 from swap_adapters import boundEntryTransaction
 
 PURCHASES=20
@@ -721,7 +722,30 @@ class LiveExecutor:
                     ['address'],[self.tx.account.address]),'latest')
         return int(raw,16)
 
-    async def buy(self,row):
+    def entryWalletConflict(self):
+        # Read-only quote/approval work does not block preparation. An actual
+        # urgent exit or unresolved wallet intent does retain priority.
+        if any(key.startswith('EXIT:') for key in getattr(self,'active',())):
+            return 'URGENT_EXIT_WALLET_PRIORITY'
+        if hasattr(self.tx,'unsettled') and self.tx.unsettled():
+            return 'WALLET_TRANSACTION_IN_FLIGHT'
+        return None
+
+    async def processEntry(self,row):
+        if self.lamb is not None:
+            if row['status']=='LAMB_QUEUED':
+                await self.lamb.start(row)
+                return
+            # Even a persisted QUEUED record must be reverified after restart.
+            prepared=await self.lamb.check(row)
+            if prepared is None:return
+            row=self.store.db.execute('SELECT * FROM selections WHERE selectionId=?',
+                                      (row['selectionId'],)).fetchone()
+            if row and row['status']=='QUEUED':await self.buy(row,prepared=prepared)
+        else:
+            await self.buy(row)
+
+    async def buy(self,row,*,prepared=None):
         selectionId=row['selectionId']; token=row['token']
         if (self.store.configuredCampaign is not None and
                 self.store.get('intakeState','OPEN')!='OPEN'):
@@ -748,6 +772,9 @@ class LiveExecutor:
             self.store.db.execute("UPDATE selections SET status='SKIPPED',reason='INVALID_CANONICAL_WINDOW_EVIDENCE' WHERE selectionId=? AND status='QUEUED'",(selectionId,))
             return
         if lamb is not None:
+            if canonicalTiming(self.store) and prepared is None:
+                prepared=await lamb.check(row)
+                if prepared is None:return
             deadlineStart=lamb.readyAt(selectionId)
             if deadlineStart is None and canonicalTiming(self.store):
                 self.store.db.execute("UPDATE selections SET status='SKIPPED',reason='MISSING_CANONICAL_SURVIVAL_ANCHOR' WHERE selectionId=? AND status='QUEUED'",(selectionId,))
@@ -767,12 +794,24 @@ class LiveExecutor:
                 time.time()<float(self.store.get("buyRetryAfter:"+selectionId,"0"))):
             return
         try:
-            rate=await self.fx.get()
-            amountWei=int((self.store.buyGbp/rate*10**18).to_integral_value(rounding=ROUND_DOWN))
-            # No one-way entry: verify a same-block executable-size reverse
-            # quote before signing. This does not guarantee future liquidity.
-            candidates=await self.swaps.verifiedBuyCandidates(token,amountWei)
-            quote=candidates[0]
+            if prepared is not None:
+                if (not isinstance(prepared,PreparedEntry) or
+                        prepared.selectionId!=selectionId or prepared.token!=token or
+                        prepared.anchor!=deadlineStart or prepared.amountWei<=0 or
+                        prepared.verifiedAt>time.time() or time.time()-prepared.verifiedAt>self.store.entryDeadlineSeconds):
+                    raise RuntimeError('INVALID_PREPARED_ENTRY')
+                amountWei=prepared.amountWei
+                quote=prepared.quote
+                originReason=None
+            else:
+                rate=await self.fx.get()
+                amountWei=int((self.store.buyGbp/rate*10**18).to_integral_value(rounding=ROUND_DOWN))
+                if canonicalTiming(self.store):
+                    candidates,originReason=await parallelReads(
+                        self.swaps.verifiedBuyCandidates(token,amountWei),self.ponsOnChain(token))
+                else:
+                    candidates=await self.swaps.verifiedBuyCandidates(token,amountWei)
+                quote=candidates[0]
             print('ENTRY TWO_WAY_QUOTE',token,
                   'buyTokens',quote['output'],
                   'buySource',quote['venue']['source'],
@@ -785,7 +824,8 @@ class LiveExecutor:
             # The detector's journal is not a lifetime registry. Verify the
             # token against the actual Pons V2 factory before ANY order is signed.
             # An unavailable or malformed response is not permission to buy.
-            originReason=await self.ponsOnChain(token)
+            if prepared is None and not canonicalTiming(self.store):
+                originReason=await self.ponsOnChain(token)
             if originReason:
                 self.store.db.execute(
                     "UPDATE selections SET status='SKIPPED_PONS',reason=? WHERE selectionId=? AND status='QUEUED'",
@@ -823,6 +863,11 @@ class LiveExecutor:
                         "UPDATE selections SET status='SKIPPED',reason='MAIN_BUDGET_LIMIT' WHERE selectionId=? AND status='QUEUED'",
                         (selectionId,))
                     return
+                if canonicalTiming(self.store):
+                    conflict=getattr(self,'entryWalletConflict',lambda:None)()
+                    if conflict:raise RuntimeError(conflict)
+                    reason=self.entryExclusion(token,json.loads(row['event']))
+                    if reason:raise RuntimeError(reason)
                 kwargs=entryKwargs(self.store,deadlineStart,self.store.entryDeadlineSeconds)
                 if kwargs:transaction=boundEntryTransaction(transaction,kwargs['deadlineAt'])
                 signed=await self.tx.create('buy:'+selectionId,selectionId,'BUY',transaction,amountWei,**kwargs)
@@ -840,6 +885,7 @@ class LiveExecutor:
                 print('BUY NOT CONFIRMED_BY_RPC',token,signed['txHash'],'state='+str(state),flush=True)
         except (RuntimeError,ValueError) as exc:
             reason=str(exc)
+            if canonicalTiming(self.store):recordFailure(self.store,selectionId,'main',reason)
             # A temporary RPC/quote error must not discard a candidate while
             # its original configured entry deadline remains unexpired.
             existing=self.store.transactions(selectionId,'BUY')
@@ -855,7 +901,12 @@ class LiveExecutor:
                 self.store.db.execute(
                     "UPDATE selections SET reason=? WHERE selectionId=? AND status='QUEUED'",
                     (reason[:160],selectionId))
-                self.store.set("buyRetryAfter:"+selectionId,time.time()+0.5)
+                retry=(retryTime(time.time(),deadlineStart+self.store.entryDeadlineSeconds,reason)
+                       if canonicalTiming(self.store) else time.time()+0.5)
+                if retry is None:
+                    self.store.db.execute("UPDATE selections SET status='SKIPPED',reason='MISSED_ENTRY_DEADLINE' WHERE selectionId=? AND status='QUEUED'",(selectionId,))
+                    return
+                self.store.set("buyRetryAfter:"+selectionId,retry)
                 print('BUY RETRYABLE',token,reason[:120],flush=True)
                 return
             if reason=='WALLET_TRANSACTION_IN_FLIGHT' and time.time()-deadlineStart<self.store.entryDeadlineSeconds:
@@ -1201,7 +1252,13 @@ class LiveExecutor:
             self.readSelections()
             self.readRevocations()
             self.readNewVenues()
-            await self.reconcileReceipts()
+            if canonicalTiming(self.store):
+                self.spawn('RECEIPTS',self.reconcileReceipts())
+                if time.time()-getattr(self,'lastEntryFxWarm',0)>=30:
+                    self.lastEntryFxWarm=time.time()
+                    self.spawn('FX_WARM',self.fx.get())
+            else:
+                await self.reconcileReceipts()
             if self.manual:self.manual.tick()
             now=time.time()
             if self.lamb and self.store.get('intakeState','OPEN')=='CLOSED' and now-self.lastVenueCheck>=0.4:
@@ -1250,7 +1307,13 @@ class LiveExecutor:
                         self.spawn('APPROVE:'+position['selectionId'],
                                    self.preApprove(position))
             approvalActive=any(key.startswith('APPROVE:') for key in self.active)
-            if not urgentExit and not approvalDue and not approvalActive:
+            if canonicalTiming(self.store):
+                if self.store.get('intakeState','OPEN')=='OPEN':
+                    for row in self.store.db.execute("SELECT * FROM selections WHERE status IN ('QUEUED','PROBE_CONFIRMED','LAMB_QUEUED') ORDER BY CASE status WHEN 'QUEUED' THEN 0 WHEN 'PROBE_CONFIRMED' THEN 1 ELSE 2 END,decisionAt LIMIT 20").fetchall():
+                        if self.lamb is not None and self.lamb.activity is not None and row['status']=='PROBE_CONFIRMED':
+                            self.spawn('ACTIVITY:'+row['selectionId'],self.lamb.collectActivity(row))
+                        self.spawn('ENTRY:'+row['selectionId'],self.processEntry(row))
+            elif not urgentExit and not approvalDue and not approvalActive:
                 for row in self.store.db.execute(
                     "SELECT * FROM selections WHERE status='QUEUED' ORDER BY decisionAt LIMIT 20"):
                     self.spawn('BUY:'+row['selectionId'],self.buy(row))
@@ -1271,7 +1334,7 @@ class LiveExecutor:
                 if self.lamb:self.store.set('executorHeartbeat',now)
                 if self.manual:self.store.set('manualExitHeartbeat',now)
                 print('LIVE HEALTH',json.dumps(self.store.status()),flush=True)
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(.10 if canonicalTiming(self.store) else .25)
 
     async def close(self):
         if self.venueWatcher is not None:await self.venueWatcher.close()

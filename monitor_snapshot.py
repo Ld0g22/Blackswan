@@ -239,7 +239,15 @@ def readSnapshot(directory,now=None,limit=50,staleAfterSeconds=180):
         keys.update(r["selectionId"] for r in selections
                     if r["status"].startswith("PROBE_") or r["status"]=="LAMB_QUEUED")
         wait=((view["policy"].get("sacrifice") or {}).get("wait") or {})
-        connectedHead=asInt(deMeta.get("lastConnectedHead"))
+        executionHead=unpack(exMeta.get('executionHead'))
+        connectedHead=asInt(executionHead.get('number'))
+        headAt=executionHead.get('at')
+        if not isinstance(headAt,(int,float)) or not 0<=now-headAt<=2:
+            connectedHead=None
+        # Old campaigns without executor-head evidence may show historical
+        # detector progress, but never a countdown greater than the wait.
+        if (view['policy'].get('selector') or {}).get('name')!='concentration' and not executionHead:
+            connectedHead=asInt(deMeta.get('lastConnectedHead'))
         for sid in keys:
             selection=selectionById.get(sid,{})
             probe=probesById.get(sid,{})
@@ -249,7 +257,7 @@ def readSnapshot(directory,now=None,limit=50,staleAfterSeconds=180):
             receiptBlock=tx.get("receiptBlock")
             blocksRemaining=None
             if (wait.get("unit")=="blocks" and receiptBlock is not None
-                    and connectedHead is not None):
+                    and connectedHead is not None and connectedHead>=receiptBlock):
                 blocksRemaining=max(0,receiptBlock+asInt(wait.get("value"),0)-connectedHead)
             status=selection.get("status") or "NOT_IN_EXECUTOR"
             view["sacrificesDetailed"].append(dict(
