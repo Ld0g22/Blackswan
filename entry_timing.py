@@ -6,9 +6,14 @@ swap, legacy manifest, sale or approval never inherits this policy implicitly.
 import json
 import time
 
+def cleanTiming(store):
+    cfg=getattr(store,'configuredCampaign',None)
+    return bool(cfg and cfg.get('schemaVersion')==4)
+
+
 def canonicalTiming(store):
     cfg=getattr(store,'configuredCampaign',None)
-    return bool(cfg and cfg.get('selector',{}).get('name')=='concentration')
+    return bool(cfg and cfg.get('schemaVersion')==3 and cfg.get('selector',{}).get('name')=='concentration')
 
 def windowEnd(store,selection):
     if not canonicalTiming(store):return float(selection['decisionAt'])

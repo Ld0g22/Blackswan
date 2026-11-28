@@ -9,7 +9,7 @@ import json
 import time
 
 from probe_buying_blocks import ProbeBuyingBlocks, MAX_BUYING_BLOCKS
-from entry_timing import (canonicalTiming, windowEnd, targetKey, entryKwargs,
+from entry_timing import (canonicalTiming, cleanTiming, windowEnd, targetKey, entryKwargs,
                           PreparedEntry, retryTime, recordFailure, parallelReads)
 from swap_adapters import boundEntryTransaction
 
@@ -56,7 +56,7 @@ class LambGate:
         # One shared block-height poll across all pending 1p positions.
         # No local estimates of block speed and no wall-clock substitution.
         async with self.headLock:
-            near=(canonicalTiming(self.store) and target is not None and
+            near=((canonicalTiming(self.store) or cleanTiming(self.store)) and target is not None and
                   self.headCached is not None and target-self.headCached<=30)
             if (self.headCached is not None
                     and time.monotonic()-self.headCheckedAt<(.20 if near else 1.0)):
@@ -64,7 +64,7 @@ class LambGate:
             current=self.blockNumber(await self.owner.rpc.call('eth_blockNumber',[]))
             self.headCached=current
             self.headCheckedAt=time.monotonic()
-            if canonicalTiming(self.store):
+            if canonicalTiming(self.store) or cleanTiming(self.store):
                 self.store.set('executionHead',json.dumps({'number':current,'at':time.time()}))
             return current
 
@@ -105,7 +105,9 @@ class LambGate:
         try:
             head=await self.chainHead(target)
         except (RuntimeError,ValueError,TypeError,KeyError) as exc:
-            if canonicalTiming(self.store):recordFailure(self.store,selectionId,'head',exc)
+            if canonicalTiming(self.store) or cleanTiming(self.store):
+                recordFailure(self.store,selectionId,'head',exc)
+                self.store.db.execute("UPDATE selections SET reason=? WHERE selectionId=?",(str(exc)[:160],selectionId))
             # Unavailable RPC is never PASS.
             return None
         if head<target:
@@ -119,16 +121,17 @@ class LambGate:
             if stamp<=0 or stamp>time.time():raise ValueError('INVALID_SURVIVAL_TIMESTAMP')
             return h,stamp
         try:
-            if canonicalTiming(self.store):
+            if canonicalTiming(self.store) or cleanTiming(self.store):
                 reads=[self.owner.rpc.call('eth_getTransactionReceipt',[row['txHash']]),
                        header(receiptBlock)]
-                if target!=receiptBlock:reads.append(header(target))
+                if canonicalTiming(self.store) and target!=receiptBlock:reads.append(header(target))
                 evidence=await parallelReads(*reads)
                 canonical=evidence[0]
             else:
                 canonical=await self.owner.rpc.call('eth_getTransactionReceipt',[row['txHash']])
         except (RuntimeError,ValueError,TypeError,KeyError) as exc:
-            if canonicalTiming(self.store):recordFailure(self.store,selectionId,'survival',exc)
+            if cleanTiming(self.store):self.state(selectionId,'PROBE_FAILED',str(exc))
+            elif canonicalTiming(self.store):recordFailure(self.store,selectionId,'survival',exc)
             return None
         if canonical is None:
             self.state(selectionId,'PROBE_UNVERIFIED','PROBE_RECEIPT_NOT_CANONICAL')
@@ -143,6 +146,14 @@ class LambGate:
         if not valid:
             self.state(selectionId,'PROBE_UNVERIFIED','PROBE_RECEIPT_REORG_OR_MISMATCH')
             return None
+        if cleanTiming(self.store):
+            receiptHeader,receiptAt=evidence[1]
+            if receiptHeader['hash'].lower()!=original['blockHash'].lower():
+                self.state(selectionId,'PROBE_UNVERIFIED','PROBE_RECEIPT_REORG_OR_MISMATCH')
+                return None
+            if self.waitBlocks is None and time.time()<receiptAt+getattr(self.store,'probeWaitSeconds',WAIT_SECONDS):
+                return None
+            return target
         if canonicalTiming(self.store):
             # Timestamp of the exact receipt/target blocks, never time of processing.
             try:
@@ -347,7 +358,7 @@ class LambGate:
         if qty<=0:
             self.state(selectionId,'PROBE_UNVERIFIED','NO_NET_PROBE_TOKEN_TRANSFER')
             return
-        if self.waitBlocks is not None or canonicalTiming(self.store):
+        if self.waitBlocks is not None or canonicalTiming(self.store) or cleanTiming(self.store):
             try:
                 self.blockNumber(receipt.get('blockNumber'))
                 if (self.blockNumber(receipt.get('status'))!=1

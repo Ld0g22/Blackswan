@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 
 from broadcast_rpc import BroadcastError, sendRaw
-from entry_timing import parallelReads
+from entry_timing import parallelReads, cleanTiming
 
 CHAIN_ID = 4663
 
@@ -75,7 +75,7 @@ class TransactionJournal:
         if deadlineAt is not None and (not math.isfinite(deadlineAt) or time.time()>deadlineAt):
             raise RuntimeError('MISSED_ENTRY_SIGNING_DEADLINE')
 
-    async def create(self, intentId, selectionId, kind, transaction, inputAmount=0, *, deadlineAt=None):
+    async def create(self, intentId, selectionId, kind, transaction, inputAmount=0, *, deadlineAt=None,beforeSign=None):
         """Return existing intent unchanged on replay. Only one in-flight transaction.
 
         A FAILED transaction may be retried by the caller with a fresh attempt ID;
@@ -97,31 +97,24 @@ class TransactionJournal:
                 raise ValueError('No recipient contract')
             call={'from':tx['from'],'to':tx['to'],'data':tx.get('data','0x'),
                   'value':hex(tx.get('value',0))}
-            if deadlineAt is not None:
-                chain,code,_,gas=await parallelReads(
-                    self.rpcCall('eth_chainId',[]),
-                    self.rpcCall('eth_getCode',[tx['to'],'latest']),
-                    self.rpcCall('eth_call',[call,'latest']),
-                    self.rpcCall('eth_estimateGas',[call]))
-                if int(chain,16)!=CHAIN_ID:raise RuntimeError('WRONG_CHAIN')
-                if not code or code=='0x':raise RuntimeError('TARGET_CONTRACT_HAS_NO_CODE')
-                self.requireDeadline(deadlineAt)
-                block,suggestedPriority,nonceRaw,balance=await parallelReads(
-                    self.rpcCall('eth_getBlockByNumber',['latest',False]),
-                    self.rpcCall('eth_maxPriorityFeePerGas',[]),
-                    self.rpcCall('eth_getTransactionCount',[tx['from'],'pending']),
-                    self.rpcCall('eth_getBalance',[tx['from'],'latest']))
-            else:
-                if int(await self.rpcCall('eth_chainId',[]),16)!=CHAIN_ID:
-                    raise RuntimeError('WRONG_CHAIN')
-                code=await self.rpcCall('eth_getCode',[tx['to'],'latest'])
-                if not code or code=='0x':raise RuntimeError('TARGET_CONTRACT_HAS_NO_CODE')
-                await self.rpcCall('eth_call',[call,'latest'])
-                gas=await self.rpcCall('eth_estimateGas',[call])
-                block=await self.rpcCall('eth_getBlockByNumber',['latest',False])
-                suggestedPriority=await self.rpcCall('eth_maxPriorityFeePerGas',[])
-                nonceRaw=await self.rpcCall('eth_getTransactionCount',[tx['from'],'pending'])
-                balance=await self.rpcCall('eth_getBalance',[tx['from'],'latest'])
+            chain,code,_,gas=await parallelReads(
+                self.rpcCall('eth_chainId',[]),
+                self.rpcCall('eth_getCode',[tx['to'],'latest']),
+                self.rpcCall('eth_call',[call,'latest']),
+                self.rpcCall('eth_estimateGas',[call]))
+            if int(chain,16)!=CHAIN_ID:raise RuntimeError('WRONG_CHAIN')
+            if not code or code=='0x':raise RuntimeError('TARGET_CONTRACT_HAS_NO_CODE')
+            self.requireDeadline(deadlineAt)
+            reads=[self.rpcCall('eth_getBlockByNumber',['latest',False]),
+                self.rpcCall('eth_maxPriorityFeePerGas',[]),
+                self.rpcCall('eth_getTransactionCount',[tx['from'],'pending']),
+                self.rpcCall('eth_getBalance',[tx['from'],'latest'])]
+            if cleanTiming(self.store):
+                reads.append(self.rpcCall('eth_getTransactionCount',[tx['from'],'latest']))
+            values=await parallelReads(*reads)
+            block,suggestedPriority,nonceRaw,balance=values[:4]
+            if cleanTiming(self.store) and int(nonceRaw,16)!=int(values[4],16):
+                raise RuntimeError('WALLET_EXTERNAL_TRANSACTION_PENDING')
             tx['gas']=int(gas,16)*125//100+15000
             tx.update(eip1559FeeFields(block,suggestedPriority))
             nonce=int(nonceRaw,16)
@@ -134,6 +127,7 @@ class TransactionJournal:
             from eth_utils import to_checksum_address
             tx['to'] = to_checksum_address(tx['to'])
             self.requireDeadline(deadlineAt)
+            if beforeSign is not None:beforeSign()
             signed = self.account.sign_transaction(tx)
             raw = getattr(signed,'raw_transaction',None)
             if raw is None:  # Support only explicitly verified SDK attributes.
@@ -141,8 +135,7 @@ class TransactionJournal:
             txHash = '0x'+bytes(signed.hash).hex()
             rawHex = '0x'+bytes(raw).hex()
             self.requireDeadline(deadlineAt)
-            if deadlineAt is not None:
-                self.store.db.execute('BEGIN IMMEDIATE')
+            self.store.db.execute('BEGIN IMMEDIATE')
             try:
                 with self.store.db:
                     self.store.db.execute('''INSERT INTO transactions
@@ -153,7 +146,7 @@ class TransactionJournal:
                         self.store.db.execute("INSERT INTO meta(key,value) VALUES(?,?)",
                                               ('entryDeadline:'+intentId,str(deadlineAt)))
             except BaseException:
-                if deadlineAt is not None and self.store.db.in_transaction:self.store.db.rollback()
+                if self.store.db.in_transaction:self.store.db.rollback()
                 raise
             return dict(self.store.db.execute('SELECT * FROM transactions WHERE intentId=?',(intentId,)).fetchone())
 
@@ -185,16 +178,8 @@ class TransactionJournal:
                     return 'EXPIRED_UNSENT'
                 # Do not retransmit stale entries; keep possible submission reconcilable.
                 return row['state']
-            # Record the attempt BEFORE the external side effect. A crash here
-            # may be uncertain but can never be mistaken for definitely unsent.
-            self.store.db.execute("UPDATE transactions SET state='UNCERTAIN',lastBroadcast=?,reason='SUBMISSION_ATTEMPT_STARTED' WHERE intentId=?",(now,intentId))
-            if time.time()>deadline:
-                # No external call occurred in this invocation. Prior attempts,
-                # if any, must remain reconcilable.
-                if row['state']=='SIGNED' and not row['lastBroadcast']:
-                    self.store.db.execute("UPDATE transactions SET state='EXPIRED_UNSENT',reason='ENTRY_DEADLINE_EXPIRED_BEFORE_SUBMISSION' WHERE intentId=?",(intentId,))
-                    return 'EXPIRED_UNSENT'
-                return 'UNCERTAIN'
+        # Every intent is durably marked possibly submitted before network I/O.
+        self.store.db.execute("UPDATE transactions SET state='UNCERTAIN',lastBroadcast=?,reason='SUBMISSION_ATTEMPT_STARTED' WHERE intentId=?",(now,intentId))
         try:
             returned=await sendRaw(self.rpc,row['raw'])
             if returned.lower()!=row['txHash'].lower():
@@ -238,6 +223,13 @@ class TransactionJournal:
             except RuntimeError:
                 continue
             if receipt:
+                if cleanTiming(self.store) and (receipt.get('transactionHash','').lower()!=row['txHash'].lower()
+                        or receipt.get('from','').lower()!=self.account.address.lower()
+                        or not isinstance(receipt.get('blockHash'),str) or len(receipt['blockHash'])!=66
+                        or receipt.get('blockNumber') is None
+                        or receipt.get('status') not in ('0x0','0x1')):
+                    print('TX RECEIPT UNVERIFIED',row['txHash'],flush=True)
+                    continue
                 state='CONFIRMED' if int(receipt['status'],16)==1 else 'REVERTED'
                 self.store.db.execute('''UPDATE transactions SET state=?,receipt=?,reason=?
                     WHERE intentId=?''',(state,json.dumps(receipt),None if state=='CONFIRMED' else 'receipt status 0',row['intentId']))
@@ -248,6 +240,14 @@ class TransactionJournal:
                 await self.broadcast(row['intentId'])
             elif row['intentId'] in self.broadcasting:
                 continue
+            elif cleanTiming(self.store) and row['kind'] in ('BUY','PROBE_BUY'):
+                if row['state']=='SIGNED' and not row['lastBroadcast']:
+                    self.store.db.execute("UPDATE transactions SET state='EXPIRED_UNSENT',reason='RESTART_UNSIGNED_INTENT' WHERE intentId=?",(row['intentId'],))
+                # Report an unresolved submission without resending, freeing its
+                # nonce, or declaring failure. Receipts remain authoritative.
+                elif now-row['createdAt']>120 and row['state']!='STUCK':
+                    self.store.db.execute("UPDATE transactions SET state='STUCK',reason='UNCONFIRMED_MANUAL_RECONCILIATION_REQUIRED' WHERE intentId=?",(row['intentId'],))
+                    print('CRITICAL STUCK TRANSACTION',row['intentId'],row['txHash'],flush=True)
             elif now-row['createdAt']>120:
                 # An old swap cannot safely be resurrected indefinitely: leave
                 # its nonce unresolved until a human checks chain/mempool state.

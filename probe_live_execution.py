@@ -35,7 +35,10 @@ async def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--env',type=Path,default=Path.home()/'blackswanRH_guarded/.env')
     p.add_argument('--wallet-file',type=Path,default=Path.home()/'Desktop/wallet.json')
+    p.add_argument('--deployment-only',action='store_true',help='Verify deployment and wallet read access, without fixed-value swap simulations')
+    p.add_argument('--exits-only',action='store_true',help='Do not require entry-only factory verification')
     args=p.parse_args()
+    if args.exits_only and not args.deployment_only:p.error('--exits-only requires --deployment-only')
     offline()
     url,wallet=peak.loadSettings(args.env,None,args.wallet_file)
     async with aiohttp.ClientSession() as session:
@@ -56,22 +59,30 @@ async def main():
               'priority',fees['maxPriorityFeePerGas'],
               'maxFee',fees['maxFeePerGas'],
               'type-2 signing (offline only)',flush=True)
-        for label,addr in [('v3 SwapRouter02',V3_ROUTER),('v4 Universal Router 2.1.2',V4_ROUTER),
-                           ('Pons factory',PONS_FACTORY),('Permit2',PERMIT2),('WETH',WETH)]:
+        for label,addr in ([('v3 SwapRouter02',V3_ROUTER),('v4 Universal Router 2.1.2',V4_ROUTER),
+                           ('Permit2',PERMIT2),('WETH',WETH),('USDG',USDG),
+                           ('v3 quoter',peak.V3_QUOTER),('v4 quoter',peak.V4_QUOTER)]+([] if args.exits_only else [('Pons factory',PONS_FACTORY)])):
             code=await rpc.call('eth_getCode',[addr,'latest'])
             if len(code)<10:raise RuntimeError('Missing live contract code: '+label)
             print('PASS code',label,addr,flush=True)
         # Verify the factory origin lookup against a known non-Pons token.
         # The execution engine refuses buys if this query/decode cannot work.
-        types=['address','address','address','address','address','uint256','uint24',
-               'int24','uint16','bool','uint8','uint256','uint256','uint256','bool']
-        _,decode,_=abiTools()
-        launch=await rpc.ethCall(PONS_FACTORY,calldata('getLaunchedToken(address)',
-                                         ['address'],[WETH]),'latest')
-        record=decode(types,bytes.fromhex(launch[2:]))
-        if len(record)!=15 or bool(record[14]):
-            raise RuntimeError('Pons V2 origin check failed for WETH')
-        print('PASS Pons V2 factory origin check on known non-Pons WETH',flush=True)
+        if not args.exits_only:
+            types=['address','address','address','address','address','uint256','uint24',
+                   'int24','uint16','bool','uint8','uint256','uint256','uint256','bool']
+            _,decode,_=abiTools()
+            launch=await rpc.ethCall(PONS_FACTORY,calldata('getLaunchedToken(address)',
+                                             ['address'],[WETH]),'latest')
+            record=decode(types,bytes.fromhex(launch[2:]))
+            if len(record)!=15 or bool(record[14]):
+                raise RuntimeError('Pons V2 origin check failed for WETH')
+            print('PASS Pons V2 factory origin check on known non-Pons WETH',flush=True)
+        if args.deployment_only:
+            native=int(await rpc.call('eth_getBalance',[wallet,'latest']),16)
+            wrapped=int(await rpc.ethCall(WETH,calldata('balanceOf(address)',['address'],[wallet]),'latest'),16)
+            print('WALLET BALANCES wei ETH',native,'WETH',wrapped,flush=True)
+            print('PASS deployment and wallet reads; route simulation required per transaction',flush=True)
+            return
         amount=10**13  # 0.00001 ETH, simulation only
         q=peak.Quotes(rpc)
         block=await rpc.block()

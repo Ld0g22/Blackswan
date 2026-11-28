@@ -16,7 +16,7 @@ import subprocess
 import threading
 import time
 
-from campaign_v3 import defaultCampaign, concentrationCampaign, validateCampaign, campaignDigest
+from campaign_v3 import defaultCampaign, concentrationCampaign, cleanCampaign, validateCampaign, campaignDigest
 from run_fresh_peaks import (validateWalletFile, detectorReady, startWorker, drain,
                              stopWorkers, newExperimentId, readLines)
 from campaign_config import otherLiveExecutors
@@ -73,14 +73,15 @@ def requireIdentity(directory,config):
         raise RuntimeError("EXECUTION_LEDGER_MISSING")
     with sqlite3.connect(f'file:{ledger.resolve()}?mode=ro',uri=True,timeout=3) as db:
         recorded=dict(db.execute("SELECT key,value FROM meta"))
-    if recorded.get("campaignVersion")!="3" or recorded.get("campaignIdentity")!=campaignDigest(config):
+    if recorded.get("campaignVersion")!=str(config["schemaVersion"]) or recorded.get("campaignIdentity")!=campaignDigest(config):
         raise RuntimeError("EXECUTION_LEDGER_IDENTITY_MISMATCH")
 
 
-def preflight(python,root,env,walletFile,sacrifice):
-    for script in (("probe_live_execution.py",) + (("lamb_readonly_preflight.py",) if sacrifice else ())):
+def preflight(python,root,env,walletFile,sacrifice,*,exitsOnly=False):
+    for script in (("probe_live_execution.py",) + (("lamb_readonly_preflight.py",) if sacrifice and not exitsOnly else ())):
+        flags=(["--deployment-only"] + (["--exits-only"] if exitsOnly else [])) if script=="probe_live_execution.py" else []
         r=subprocess.run([str(python),str(root/script),"--env",str(env),
-                          "--wallet-file",str(walletFile)],check=False)
+                          "--wallet-file",str(walletFile),*flags],check=False)
         if r.returncode:
             raise RuntimeError("READ_ONLY_PREFLIGHT_FAILED: "+script)
 
@@ -102,6 +103,12 @@ def startOrResume(args,root):
         directory=args.run_dir.expanduser().resolve()
         config=validateCampaign(json.loads((directory/"campaign.json").read_text()))
         requireIdentity(directory,config)
+    if config["schemaVersion"]!=4:
+        raise ValueError("LEGACY_CAMPAIGN_USE_PINNED_REVISION_b5e4a69")
+    # This branch is based on concentration. Do not silently substitute its
+    # historical buying-block defaults for the independent 3–10 block build.
+    if config["selector"]["name"]!="concentration":
+        raise ValueError("BUYING_BLOCK_CLEAN_PORT_NOT_VERIFIED_USE_INDEPENDENT_BUILD")
     if not args.arm_live:
         raise ValueError("LIVE_TRADING_REQUIRES_EXPLICIT_--arm-live")
     if args.env is None:
@@ -121,10 +128,14 @@ def startOrResume(args,root):
     selectorCommand(config,root,python,env,Path("/detector"),Path("/selector"))
     if otherLiveExecutors():
         raise RuntimeError("OVERLAPPING_LIVE_EXECUTOR_REFUSED")
-    preflight(python,root,env,walletFile,config["sacrifice"]["enabled"])
+    sourceClosed=False
+    if directory is not None:
+        with sqlite3.connect(f'file:{(directory/"execution.sqlite3").resolve()}?mode=ro',uri=True,timeout=3) as db:
+            sourceClosed=not resumeNeedsSources(dict(db.execute("SELECT key,value FROM meta")))
+    preflight(python,root,env,walletFile,config["sacrifice"]["enabled"],exitsOnly=sourceClosed)
 
     if directory is None:
-        directory=args.data_dir.expanduser().resolve()/("configured_v3_"+newExperimentId())
+        directory=args.data_dir.expanduser().resolve()/("configured_v4_"+newExperimentId())
         directory.mkdir(parents=True,exist_ok=False)
         (directory/"campaign.json").write_text(json.dumps(config,sort_keys=True,indent=2)+"\n")
 
@@ -136,33 +147,25 @@ def startOrResume(args,root):
         detDb=directory/"detector.sqlite3"
         selDb=directory/"selector.sqlite3"
         exeDb=directory/"execution.sqlite3"
-        if args.command=="resume" and exeDb.is_file():
-            with sqlite3.connect(f'file:{exeDb.resolve()}?mode=ro',uri=True,timeout=3) as db:
-                current=dict(db.execute("SELECT key,value FROM meta"))
-            sourceClosed=not resumeNeedsSources(current)
-        else:
-            sourceClosed=False
         detector=selector=None
         if not sourceClosed:
             detector=startWorker("DETECTOR",[
                 str(python),"-u",str(root/"detector.py"),"run","--env",str(env),
                 "--db",str(detDb)],messages)
             workers.append(detector)
-            readyDeadline=time.monotonic()+25
             while not detectorReady(detDb):
                 drain(messages)
-                if detector.poll() is not None or time.monotonic()>readyDeadline:
+                if detector.poll() is not None:
                     raise RuntimeError("DETECTOR_STARTUP_FAILED")
                 time.sleep(.05)
             selector=startWorker("SELECTOR",selectorCommand(
                 config,root,python,env,detDb,selDb),messages)
             workers.append(selector)
-            readyDeadline=time.monotonic()+15
             while (not selDb.is_file() or
                    (config["selector"]["name"]=="concentration" and
                     not selectorReady(selDb))):
                 drain(messages)
-                if selector.poll() is not None or time.monotonic()>readyDeadline:
+                if selector.poll() is not None:
                     raise RuntimeError("SELECTOR_STARTUP_FAILED_OR_WRONG_CHAIN")
                 time.sleep(.05)
         elif not detDb.is_file() or not selDb.is_file():
@@ -232,7 +235,7 @@ def main():
     parser.add_argument("--config",type=Path)
     parser.add_argument("--wallet-address")
     parser.add_argument("--micro-test",action="store_true",help="Template only: 1 x £0.05 main, 1 x £0.01 sacrifice, nominal £0.06 cap; excludes gas")
-    parser.add_argument("--selector",choices=("buyingBlocks","concentration"),default="buyingBlocks",help="New campaign template selector only")
+    parser.add_argument("--selector",choices=("buyingBlocks","concentration"),default="concentration",help="New campaign template selector only")
     parser.add_argument("--arm-live",action="store_true")
     parser.add_argument("--run-dir",type=Path)
     parser.add_argument("--env",type=Path,help="Explicit verified NEW Alchemy environment")
@@ -245,8 +248,7 @@ def main():
         if args.command=="template":
             if args.config is None or args.wallet_address is None:
                 parser.error("template requires --config and --wallet-address")
-            config=(concentrationCampaign(args.wallet_address) if args.selector=="concentration"
-                    else validateCampaign(defaultCampaign(args.wallet_address)))
+            config=cleanCampaign(args.wallet_address,args.selector)
             if args.micro_test:
                 config["main"]={"stakeGbp":"0.05","maxPurchases":1}
                 config["limits"]={"maxSacrifices":1,"maxNominalSpendGbp":"0.06"}
@@ -297,7 +299,7 @@ def main():
                                   "workerState":meta.get("workerState"),
                                   "version":meta.get("campaignVersion")},indent=2))
             return
-        if args.selector!="buyingBlocks":
+        if args.selector!="concentration":
             parser.error("--selector is for template generation; campaign start/resume reads the frozen config")
         startOrResume(args,Path(__file__).resolve().parent)
     except (ValueError,RuntimeError,OSError,KeyError,json.JSONDecodeError,sqlite3.Error) as exc:

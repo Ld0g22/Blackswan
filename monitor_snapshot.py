@@ -246,7 +246,7 @@ def readSnapshot(directory,now=None,limit=50,staleAfterSeconds=180):
             connectedHead=None
         # Old campaigns without executor-head evidence may show historical
         # detector progress, but never a countdown greater than the wait.
-        if (view['policy'].get('selector') or {}).get('name')!='concentration' and not executionHead:
+        if view['policy'].get('schemaVersion')!=4 and (view['policy'].get('selector') or {}).get('name')!='concentration' and not executionHead:
             connectedHead=asInt(deMeta.get('lastConnectedHead'))
         for sid in keys:
             selection=selectionById.get(sid,{})
@@ -433,7 +433,7 @@ def readSnapshot(directory,now=None,limit=50,staleAfterSeconds=180):
         view["counts"]["mainCommitted"]=mainCount
         unsettled=safeRows(ex,
             "SELECT COUNT(*) AS count FROM transactions "
-            "WHERE state IN ('SIGNED','SENT','UNCERTAIN','STUCK')",
+            "WHERE state IN ('SIGNED','SENT','UNCERTAIN','STUCK','REJECTED')",
             (),view,"all unsettled transactions")
         view["counts"]["unsettledTx"]=unsettled[0]["count"] if unsettled else None
         view["counts"]["nominalCommittedGbp"]=(

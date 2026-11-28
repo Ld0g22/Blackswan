@@ -517,7 +517,7 @@ class Tracker:
             self.store.saveMeta('cursor', str(row['seq']))
         return len(rows)
 
-    async def best(self, token: str, amount: int, buying: bool) -> dict:
+    async def best(self, token: str, amount: int, buying: bool, *, atomicOnly=False) -> dict:
         """Compare complete ETH/WETH or USDG->ETH paths at ONE block.
 
         All SELL paths take the exact, complete position quantity. Every output
@@ -529,7 +529,7 @@ class Tracker:
         block = await self.rpc.block()
         contenders = []
         failures = []
-        usdGBuyBridges = None  # cache one bridge comparison for all USDG entry pools
+        usdGBuyBridges = {}  # cache bridge comparisons by execution protocol
         researchCandidates = {}
 
         def rememberCandidate():
@@ -538,9 +538,11 @@ class Tracker:
                 if quotes:
                     researchCandidates[id(contenders[-1])] = quotes[-1]
 
-        async def conversions(inputToken: str, inputAmount: int) -> tuple[list[dict], list[str]]:
+        async def conversions(inputToken: str, inputAmount: int, source=None) -> tuple[list[dict], list[str]]:
             results, problems = [], []
             for bridge in USDG_BRIDGES:
+                if source is not None and bridge['source'] != source:
+                    continue
                 # v3 deals in WETH; v4 deals in native ETH. Native<->WETH
                 # wrapping is 1:1 before gas, which is explicitly excluded.
                 actualInput = (WETH if bridge['source'] == 'uniswapV3' else NATIVE)
@@ -568,10 +570,11 @@ class Tracker:
                 except (ValueError, RuntimeError) as error:
                     failures.append(f"{venue['id'][:12]}:{str(error)[:55]}")
             elif counterpart == USDG:
+                bridgeSource=venue['source'] if atomicOnly else None
                 if buying:
-                    if usdGBuyBridges is None:
-                        usdGBuyBridges = await conversions('ETH', amount)
-                    bridges, problems = usdGBuyBridges
+                    if bridgeSource not in usdGBuyBridges:
+                        usdGBuyBridges[bridgeSource] = await conversions('ETH', amount,bridgeSource)
+                    bridges, problems = usdGBuyBridges[bridgeSource]
                     failures.extend(problems)
                     for bridge in bridges:
                         try:
@@ -590,7 +593,7 @@ class Tracker:
                         # Entire ORIGINAL position first becomes USDG, then ETH.
                         sampledAt = time.time()
                         quoted = await self.quotes.quote(venue, token, amount, block)
-                        bridges, problems = await conversions(USDG, quoted['out'])
+                        bridges, problems = await conversions(USDG, quoted['out'],bridgeSource)
                         failures.extend(problems)
                         for bridge in bridges:
                             contenders.append(dict(

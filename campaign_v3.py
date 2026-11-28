@@ -64,10 +64,10 @@ def _gbp(value, label):
 
 def validateCampaign(raw: dict) -> dict:
     """Validate without mutating input; normalize to an unambiguous identity."""
-    _shape(raw, ("schemaVersion", "chainId", "walletPublicAddress", "selector",
-                 "main", "sacrifice", "exits", "execution", "limits"), "CAMPAIGN")
-    if type(raw["schemaVersion"]) is not int or raw["schemaVersion"] != 3:
+    if not isinstance(raw,dict) or type(raw.get("schemaVersion")) is not int or raw["schemaVersion"] not in (3,4):
         raise ValueError("UNSUPPORTED_CAMPAIGN_VERSION")
+    fields=("schemaVersion","chainId","walletPublicAddress","selector","main","sacrifice","exits","limits")
+    _shape(raw, fields+("execution",) if raw["schemaVersion"]==3 else fields,"CAMPAIGN")
     if type(raw["chainId"]) is not int or raw["chainId"] != 4663:
         raise ValueError("WRONG_CHAIN")
     wallet = raw["walletPublicAddress"]
@@ -144,10 +144,11 @@ def validateCampaign(raw: dict) -> dict:
     if not Decimal(0) < seen <= Decimal(100):
         raise ValueError("EXIT_PERCENTAGES_EXCEED_100")
 
-    execution = raw["execution"]
-    _shape(execution, ("entryDeadlineSeconds", "sacrificeDeadlineSeconds"), "EXECUTION")
-    for name in execution:
-        _integer(execution[name], name, 1, 60)
+    if raw["schemaVersion"]==3:
+        execution=raw["execution"]
+        _shape(execution,("entryDeadlineSeconds","sacrificeDeadlineSeconds"),"EXECUTION")
+        for name in execution:
+            _integer(execution[name],name,1,60)
 
     limits = raw["limits"]
     _shape(limits, ("maxSacrifices", "maxNominalSpendGbp"), "LIMITS")
@@ -190,4 +191,13 @@ def concentrationCampaign(wallet: str) -> dict:
         "maxLargestBuyTransactionShareBps": 2500,
         "firstTradeTimeoutSeconds": 300,
     }
+    return validateCampaign(policy)
+
+def cleanCampaign(wallet: str, selector="concentration") -> dict:
+    """New campaign identity; no local trading deadlines."""
+    if selector not in ("concentration","buyingBlocks"):
+        raise ValueError("UNREGISTERED_SELECTOR")
+    policy=concentrationCampaign(wallet) if selector=="concentration" else defaultCampaign(wallet)
+    policy["schemaVersion"]=4
+    del policy["execution"]
     return validateCampaign(policy)

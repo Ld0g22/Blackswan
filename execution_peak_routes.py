@@ -4,13 +4,14 @@ The original peak_tracker.Tracker.best() chooses all entry/sell quotes.
 This module ONLY turns its selected route into an existing real swap
 transaction and checks a full-size reverse quote before buying.
 
-Unsupported mixed v3/v4 multihop routes are NEVER guessed or silently
-replaced with a worse route. Pons curve and graduation-hook execution
+Clean campaigns rank only atomic executable routes; historical research
+retains its original comparison of all quoted paths. Pons curve and graduation-hook execution
 remain excluded by the already-locked entry policy.
 """
 from types import SimpleNamespace
 
 import peak_tracker as peak
+from entry_timing import cleanTiming
 from swap_adapters import SwapAdapters, NATIVE, WETH, USDG, PONS_HOOK, counterpart
 
 
@@ -57,7 +58,10 @@ class PeakExecutionRoutes:
             rpc=_BlockRpc(block),
             store=_EligibleVenues(self.store,self.allowedExecutionSources),
             quotes=self.originalQuoter,exporter=None)
-        result=await peak.Tracker.best(original,token,amount,buy)
+        if cleanTiming(self.store):
+            result=await peak.Tracker.best(original,token,amount,buy,atomicOnly=True)
+        else:
+            result=await peak.Tracker.best(original,token,amount,buy)
         return result
 
     def _asExecutable(self,token,raw,buy):
